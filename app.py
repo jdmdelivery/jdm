@@ -1,22 +1,5 @@
 # ============================================================
-#  JDM CASH NOW – Sistema de Préstamos Multi-Rol (PostgreSQL)
-#  Funciones:
-#   - Pago de CAPITAL, INTERÉS o CUOTA (capital+interés)
-#   - Si paga capital → reduce remaining automático
-#   - Si se paga el TOTAL (capital + intereses) → préstamo se cierra (status='cerrado')
-#   - Cobradores aislados (no ven clientes de otros)
-#   - Admin reasigna clientes entre cobradores
-#   - Admin/Supervisor puede mover un solo cliente de cobrador
-#   - Compatible con Flask 3 (sin before_first_request)
-#   - Tema Claro / Oscuro con botón de cambio
-#   - Frecuencia: diario / semanal / quincenal / mensual
-#   - Atrasos aproximados según frecuencia e intereses
-#   - Registro de efectivo entregado por trabajador (Gastos de ruta)
-#   - Enviar factura al cliente por WhatsApp / SMS
-# ============================================================
-
-# ============================================================
-#  BLOQUE 1 — CONFIGURACIÓN PRINCIPAL + BASE DE DATOS
+#  JDM CASH NOW PRO – Sistema de Préstamos Multi-Rol (PostgreSQL)
 # ============================================================
 
 from __future__ import annotations
@@ -35,22 +18,23 @@ import secrets
 from urllib.parse import quote_plus
 
 # ============================================================
-#   CONFIGURACIÓN DEL SISTEMA
+# CONFIGURACIÓN PRINCIPAL
 # ============================================================
 
 APP_BRAND = "JDM Cash Now Pro"
 CURRENCY = "RD$"
 ADMIN_PIN = os.getenv("ADMIN_PIN", "5555")
 ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
+
 ROLES = ("admin", "supervisor", "cobrador")
 
 # ============================================================
-#   CONEXIÓN A LA BASE DE DATOS POSTGRES
+# CONEXIÓN A LA BASE DE DATOS
 # ============================================================
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise Exception("❌ ERROR: No está configurada la variable DATABASE_URL en Render.")
+    raise Exception("❌ ERROR: No está configurada la variable DATABASE_URL.")
 
 def get_conn():
     return psycopg2.connect(
@@ -60,108 +44,24 @@ def get_conn():
     )
 
 # ============================================================
-#   CREACIÓN DE LA APLICACIÓN FLASK
+# FORMATO DE MONEDA
+# ============================================================
+
+def fmt_money(v):
+    try:
+        return f"{CURRENCY}{float(v):,.2f}"
+    except:
+        return f"{CURRENCY}0.00"
+
+# ============================================================
+# FLASK APP
 # ============================================================
 
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
 # ============================================================
-#   CREACIÓN / RESET DE TABLAS
-# ============================================================
-
-# ============================================================
-# CREACIÓN / RESET DE TABLAS
-# ============================================================
-
-def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
-    try:
-        # ---- Tabla usuarios ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(100) UNIQUE NOT NULL,
-                password_hash TEXT NOT NULL,
-                rol VARCHAR(20) NOT NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
-
-        # ---- Tabla clientes ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS clients (
-                id SERIAL PRIMARY KEY,
-                first_name VARCHAR(100) NOT NULL,
-                last_name VARCHAR(100),
-                phone VARCHAR(50),
-                address VARCHAR(200),
-                document VARCHAR(100),
-                route VARCHAR(100),
-                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
-
-        # ---- Tabla préstamos ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS loans (
-                id SERIAL PRIMARY KEY,
-                client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-                amount NUMERIC(12,2) NOT NULL,
-                rate NUMERIC(5,2) NOT NULL DEFAULT 0,
-                frequency VARCHAR(20) NOT NULL,
-                start_date DATE NOT NULL,
-                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                remaining NUMERIC(12,2),
-                total_interest_paid NUMERIC(12,2) DEFAULT 0,
-                status VARCHAR(20) DEFAULT 'activo',
-                term_count INTEGER,
-                end_date DATE
-            );
-        """)
-
-        # ---- Tabla pagos ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id SERIAL PRIMARY KEY,
-                loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
-                amount NUMERIC(12,2) NOT NULL,
-                type VARCHAR(20) NOT NULL,   -- interes / capital / cuota
-                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
-
-        # ========================
-        # AGREGAR NUEVAS COLUMNAS
-        # ========================
-
-        # Asegurar columnas nuevas
-        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS fee_percent NUMERIC(5,2) DEFAULT 10;""")
-        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(12,2) DEFAULT 0;""")
-        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS disbursement NUMERIC(12,2) DEFAULT 0;""")
-        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS auto_end_date DATE;""")
-
-        # Asegurar route en clientes
-        cur.execute("""ALTER TABLE clients ADD COLUMN IF NOT EXISTS route VARCHAR(100);""")
-
-        # Inicializar valores nulos
-        cur.execute("""UPDATE loans SET remaining = amount WHERE remaining IS NULL;""")
-        cur.execute("""UPDATE loans SET total_interest_paid = 0 WHERE total_interest_paid IS NULL;""")
-
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        print("❌ Error en init_db:", e)
-    finally:
-        cur.close()
-        conn.close()
-
-
-# ============================================================
-#  PARTE 2 — Usuario actual, roles, auditoría, layout y login
+# SESIÓN / USUARIO ACTUAL
 # ============================================================
 
 def current_user():
@@ -170,406 +70,217 @@ def current_user():
         return None
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE id = %s;", (uid,))
+    cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
     user = cur.fetchone()
     cur.close()
     conn.close()
     return user
 
+# ============================================================
+# DECORADORES DE SEGURIDAD
+# ============================================================
 
 def login_required(fn):
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not session.get("user_id"):
-            flash("Debe iniciar sesión primero.", "warning")
+        if not current_user():
+            flash("Debe iniciar sesión.", "danger")
             return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrapper
 
+def admin_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        user = current_user()
+        if not user or user["rol"] != "admin":
+            flash("Acceso denegado.", "danger")
+            return redirect(url_for("index"))
+        return fn(*args, **kwargs)
+    return wrapper
 
-def role_required(*allowed_roles):
+def role_required(allowed_roles):
     def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             user = current_user()
-            if not user or user["role"] not in allowed_roles:
-                flash("No tiene permiso para acceder aquí.", "danger")
+            if not user or user["rol"] not in allowed_roles:
+                flash("No tiene permiso.", "danger")
                 return redirect(url_for("index"))
             return fn(*args, **kwargs)
         return wrapper
     return decorator
 
+# ============================================================
+# TEMA CLARO / OSCURO
+# ============================================================
 
-def admin_required(fn):
-    return role_required("admin")(fn)
+def get_theme():
+    return session.get("theme", "light")
 
+@app.route("/toggle-theme")
+def toggle_theme():
+    session["theme"] = "dark" if get_theme() == "light" else "light"
+    return redirect(request.referrer or url_for("index"))
+
+# ============================================================
+# AUDITORÍA
+# ============================================================
 
 def log_action(user_id, action, detail=""):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO audit_log (user_id, action, detail)
-        VALUES (%s, %s, %s)
+        VALUES (%s,%s,%s)
     """, (user_id, action, detail))
     conn.commit()
     cur.close()
     conn.close()
 
-
-# =============================
-# ESTILO BASE (tema claro + oscuro)
-# =============================
+# ============================================================
+# LAYOUT PREMIUM (GREEN)
+# ============================================================
 
 BASE_STYLE = """
 <style>
-:root {
-  --green-50: #ecfdf3;
-  --green-100: #dcfce7;
-  --green-200: #bbf7d0;
-  --green-600: #16a34a;
-  --green-700: #15803d;
-  --green-800: #166534;
-  --red-600: #dc2626;
-  --slate-800: #0f172a;
-  --slate-900: #020617;
-}
-
 body {
-  margin: 0;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 0; 
+    font-family: system-ui; 
+    background-color: {% if theme=='dark' %}#121212{% else %}#f2faf4{% endif %};
+    color: {% if theme=='dark' %}#e8e8e8{% else %}#222{% endif %};
 }
 
-/* Tema claro */
-body.theme-light {
-  background: var(--green-50);
-  color: #022c22;
+/* NAVBAR SUPERIOR */
+.navbar {
+    background: #1b5e20; 
+    padding: 12px 18px; 
+    display: flex; 
+    align-items: center;
+    justify-content: space-between;
+    color: white;
+}
+.navbar a {
+    color: white; 
+    text-decoration: none; 
+    margin-right: 15px;
+    font-weight: 500;
+}
+.nav-links {
+    display: flex; 
+    gap: 14px;
 }
 
-/* Tema oscuro */
-body.theme-dark {
-  background: linear-gradient(135deg, #06131a 0%, #022c22 45%, #111827 100%);
-  color: #f9fafb;
-}
-
-/* Top bar */
-header.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 12px 28px;
-  border-bottom: 1px solid var(--green-200);
-  background: #e9fdf2;
-}
-
-body.theme-dark header.topbar {
-  background: #022c22;
-  border-bottom-color: #064e3b;
-}
-
-.topbar-left {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-weight: 800;
-  font-size: 1.25rem;
-  color: #065f46;
-}
-
-body.theme-dark .topbar-left {
-  color: #bbf7d0;
-}
-
-.topbar-left span.logo-icon {
-  font-size: 1.4rem;
-}
-
-.topbar-middle {
-  flex: 1;
-  display: flex;
-  justify-content: center;
-}
-
-nav.main-nav {
-  display: flex;
-  gap: 20px;
-  font-size: 0.98rem;
-}
-
-nav.main-nav a {
-  text-decoration: none;
-  color: #065f46;
-  font-weight: 600;
-}
-
-nav.main-nav a:hover {
-  text-decoration: underline;
-}
-
-body.theme-dark nav.main-nav a {
-  color: #e5e7eb;
-}
-
-.topbar-right {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 0.85rem;
-}
-
-.theme-toggle a {
-  text-decoration: none;
-  font-weight: 600;
-  color: #047857;
-}
-
-body.theme-dark .theme-toggle a {
-  color: #bbf7d0;
-}
-
-.user-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 4px 10px;
-  border-radius: 999px;
-  background: rgba(22, 163, 74, 0.15);
-  font-size: 0.8rem;
-}
-
-body.theme-dark .user-pill {
-  background: rgba(15,23,42,0.8);
-}
-
-.btn {
-  padding: 7px 14px;
-  border-radius: 999px;
-  border: none;
-  cursor: pointer;
-  font-size: 0.9rem;
-}
-
-.btn-primary {
-  background: var(--green-600);
-  color: #ecfdf5;
-}
-
-.btn-primary:hover {
-  background: var(--green-700);
-}
-
-.btn-danger {
-  background: var(--red-600);
-  color: #fef2f2;
-}
-
-.btn-danger:hover {
-  background: #b91c1c;
-}
-
-.btn-secondary {
-  background: #e5e7eb;
-  color: #0f172a;
-}
-
-body.theme-dark .btn-secondary {
-  background: #334155;
-  color: #e5e7eb;
-}
-
-.btn-logout {
-  background: #16a34a;
-  color: white;
-}
-
-.btn-logout:hover {
-  background: #15803d;
-}
-
-/* Contenedor principal */
+/* CONTENIDO */
 .container {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 24px 20px 40px;
+    width: 92%;
+    max-width: 1200px;
+    margin: 25px auto;
 }
 
-/* Cards y dashboard */
+/* CARDS */
 .card {
-  background: white;
-  padding: 18px 18px 20px;
-  border-radius: 22px;
-  margin-bottom: 18px;
-  box-shadow: 0 18px 40px rgba(15, 118, 110, 0.12);
-  border: 1px solid #d1fae5;
+    background: {% if theme=='dark' %}#1e1e1e{% else %}white{% endif %};
+    padding: 22px;
+    border-radius: 12px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.12);
+    margin-bottom: 20px;
 }
 
-body.theme-dark .card {
-  background: rgba(15,23,42,0.96);
-  border-color: rgba(22,163,74,0.4);
+/* BOTONES */
+.btn {
+    padding: 8px 16px;
+    border-radius: 6px;
+    text-decoration: none;
+    font-weight: 600;
+    display: inline-block;
+    cursor: pointer;
+}
+.btn-primary {
+    background: #2e7d32; 
+    color: white;
+}
+.btn-secondary {
+    background: #004d40; 
+    color: white;
+}
+.btn-danger {
+    background: #b71c1c; 
+    color: white;
 }
 
-.card h2, .card h3 {
-  margin-top: 0;
-  color: #065f46;
-}
-
-body.theme-dark .card h2,
-body.theme-dark .card h3 {
-  color: #bbf7d0;
-}
-
-.hero-title {
-  font-size: 3rem;
-  font-weight: 900;
-  text-align: center;
-  margin: 10px 0 26px;
-  background: linear-gradient(90deg, #b91c1c, #4b0082);
-  -webkit-background-clip: text;
-  -webkit-text-fill-color: transparent;
-}
-
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1.2fr);
-  gap: 24px;
-  align-items: stretch;
-}
-
-@media (max-width: 900px) {
-  .dashboard-grid {
-    grid-template-columns: 1fr;
-  }
-}
-
-.kpi-big {
-  font-size: 2.6rem;
-  font-weight: 800;
-  margin: 0 0 10px;
-}
-
-.kpi-label {
-  font-size: 0.9rem;
-  color: #4b5563;
-}
-
-body.theme-dark .kpi-label {
-  color: #e5e7eb;
-}
-
-.table-wrapper {
-  margin-top: 12px;
-  border-radius: 18px;
-  overflow: hidden;
-}
-
-/* Tabla */
+/* TABLAS */
 table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9rem;
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 12px;
+}
+table th, table td {
+    padding: 10px;
+    border-bottom: 1px solid #ccc;
+}
+table th {
+    background: {% if theme=='dark' %}#333{% else %}#e8f5e9{% endif %};
 }
 
-th, td {
-  padding: 9px 10px;
-  border-bottom: 1px solid rgba(148,163,184,0.4);
+/* INPUTS */
+input, select {
+    width: 100%;
+    padding: 10px;
+    margin-top: 6px;
+    border-radius: 6px;
+    border: 1px solid #aaa;
+    background: {% if theme=='dark' %}#2c2c2c{% else %}white{% endif %};
+    color: inherit;
 }
 
-th {
-  background: #ecfdf3;
-  text-align: left;
-}
-
-body.theme-dark th {
-  background: rgba(30,64,175,0.25);
-}
-
-tr:nth-child(even) td {
-  background: #f9fffb;
-}
-
-body.theme-dark tr:nth-child(even) td {
-  background: rgba(15,23,42,0.7);
-}
-
-/* Mensajes flash */
-.flash-danger { color:#b91c1c; margin-bottom:6px; }
-.flash-warning { color:#b45309; margin-bottom:6px; }
-.flash-success { color:#166534; margin-bottom:6px; }
-.flash-info { color:#0369a1; margin-bottom:6px; }
+/* FLASHES */
+.flash-success {background:#c8e6c9;padding:10px;border-radius:6px;color:#256029;margin-bottom:10px;}
+.flash-danger {background:#ffcdd2;padding:10px;border-radius:6px;color:#b71c1c;margin-bottom:10px;}
+.flash-warning {background:#fff9c4;padding:10px;border-radius:6px;color:#8a6d00;margin-bottom:10px;}
 </style>
 """
-
-
-# =============================
-# LAYOUT GENERAL
-# =============================
 
 TPL_LAYOUT = """
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="utf-8">
-  <title>{{ app_brand }}</title>
-  """ + BASE_STYLE + """
+<meta charset="utf-8"/>
+<title>{{ app_brand }}</title>
+""" + BASE_STYLE + """
 </head>
-<body class="theme-{{ theme or 'light' }}">
+<body>
 
-<header class="topbar">
-  <div class="topbar-left">
-    <span class="logo-icon">💵</span>
-    <span>{{ app_brand }}</span>
-  </div>
-
-  {% if user %}
-  <div class="topbar-middle">
-<nav class="main-nav">
-    <a href="{{ url_for('index') }}">Inicio</a>
-    <a href="{{ url_for('clients') }}">Clientes</a>
-    <a href="{{ url_for('loans') }}">Préstamos</a>
-    <a href="{{ url_for('route_expenses') }}">Gastos de ruta</a>
-    <a href="{{ url_for('audit') }}">Registro</a>
-    {% if user.role in ['admin','supervisor'] %}
-    <a href="{{ url_for('reassign_clients') }}">Migrar rutas</a>
-    <a href="{{ url_for('users') }}">Usuarios</a>
-    {% endif %}
-</nav>
-
-  </div>
-
-  <div class="topbar-right">
-    <span class="theme-toggle">
-      Tema:
-      {% if theme == 'dark' %}
-        <a href="{{ url_for('toggle_theme') }}">🌙 Oscuro</a>
-      {% else %}
-        <a href="{{ url_for('toggle_theme') }}">☀️ Claro</a>
-      {% endif %}
-    </span>
-    <span class="user-pill">
-      <span>👤</span>
-      <span>{{ user.username }} ({{ user.role }})</span>
-    </span>
-    <a class="btn btn-logout" href="{{ url_for('logout') }}">Salir</a>
-  </div>
-  {% endif %}
-</header>
+<!-- NAVBAR SUPERIOR -->
+<div class="navbar">
+    <div><b>{{ app_brand }}</b></div>
+    <div class="nav-links">
+        <a href="/">Inicio</a>
+        <a href="/clients">Clientes</a>
+        <a href="/loans">Préstamos</a>
+        <a href="/route-expenses">Gastos</a>
+        {% if user.rol == 'admin' %}
+            <a href="/audit">Auditoría</a>
+        {% endif %}
+        <a href="/toggle-theme">🌓 Tema</a>
+        <a href="/logout">Salir</a>
+    </div>
+</div>
 
 <div class="container">
-  {% if flashes %}
-    {% for cat, msg in flashes %}
-      <div class="flash-{{ cat }}">{{ msg }}</div>
+    {% for cat,msg in flashes %}
+        <div class="flash-{{cat}}">{{msg}}</div>
     {% endfor %}
-  {% endif %}
-  {{ body|safe }}
+
+    {{ body }}
 </div>
 
 </body>
 </html>
 """
-
-
-# =============================
+# ============================================================
 # LOGIN
-# =============================
+# ============================================================
 
 TPL_LOGIN = """
 <!DOCTYPE html>
@@ -577,90 +288,33 @@ TPL_LOGIN = """
 <head>
 <meta charset="utf-8"/>
 <title>{{ app_brand }} · Login</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
-
 <style>
-body {
-    background:#e8f5e9;
-    font-family: system-ui;
-    margin:0;
-    padding:0;
-}
-.header {
-    background:#c8e6c9;
-    padding:15px;
-    text-align:center;
-    font-size:22px;
-    font-weight:700;
-    color:#1b5e20;
-}
+body { background:#e8f5e9; font-family: system-ui; }
 .card {
-    background:white;
-    width:90%;
-    max-width:400px;
-    margin:40px auto;
-    padding:25px;
-    border-radius:15px;
-    box-shadow:0 4px 10px rgba(0,0,0,0.15);
+    background:white; width:90%; max-width:400px;
+    margin:40px auto; padding:25px;
+    border-radius:15px; box-shadow:0 4px 10px rgba(0,0,0,0.15);
 }
-h1 {
-    font-size:32px;
-    text-align:center;
-    background: linear-gradient(90deg, #b91c1c, #4b0082);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
-    font-weight:900;
-    margin-bottom:20px;
-}
-label {
-    font-size:15px;
-    color:#1b5e20;
-    font-weight:600;
+.flash-danger { background:#ffcdd2; padding:10px; border-radius:10px; color:#b71c1c; }
+button {
+    width:100%; padding:10px; margin-top:15px;
+    background:#2e7d32; color:white; border:none;
+    border-radius:6px; cursor:pointer;
 }
 input {
-    width:100%;
-    padding:10px;
-    margin-top:5px;
-    margin-bottom:12px;
-    border-radius:8px;
-    border:1px solid #a5d6a7;
-    font-size:16px;
-}
-button {
-    width:100%;
-    padding:12px;
-    border:none;
-    background:#2e7d32;
-    color:white;
-    font-size:18px;
-    font-weight:700;
-    border-radius:10px;
-    cursor:pointer;
-}
-.flash-danger {
-    background:#ffcdd2;
-    padding:10px;
-    border-radius:10px;
-    color:#b71c1c;
-    margin-bottom:15px;
-    text-align:center;
-    font-weight:600;
+    width:100%; padding:10px; margin-top:8px;
+    border:1px solid #bbb; border-radius:6px;
 }
 </style>
-
 </head>
 <body>
 
-<div class="header">JDM Cash Now</div>
-
 <div class="card">
-    {% if flashes %}
-        {% for cat, msg in flashes %}
-            <div class="flash-{{ cat }}">{{ msg }}</div>
-        {% endfor %}
-    {% endif %}
+    {% for cat, msg in flashes %}
+      <div class="flash-{{ cat }}">{{ msg }}</div>
+    {% endfor %}
 
-    <h1>JDM Cash Now</h1>
+    <h1 style="text-align:center;">{{ app_brand }}</h1>
 
     <form method="post">
         <label>Usuario</label>
@@ -671,24 +325,10 @@ button {
 
         <button>Entrar</button>
     </form>
-
-    <p style="margin-top:15px;text-align:center;font-size:14px;">
-        <a href="{{ url_for('forgot_password') }}" style="color:#2e7d32;text-decoration:none;">
-            ¿Olvidó su contraseña?
-        </a>
-    </p>
-
-    <p style="margin-top:5px;text-align:center;font-size:14px;">
-        <a href="https://wa.me/{{ admin_whatsapp }}" target="_blank" style="color:#1b5e20;">
-            Recuperar por WhatsApp ({{ admin_whatsapp }})
-        </a>
-    </p>
 </div>
-
 </body>
 </html>
 """
-
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
@@ -698,7 +338,7 @@ def login():
 
         conn = get_conn()
         cur = conn.cursor()
-        cur.execute("SELECT * FROM users WHERE username = %s;", (username,))
+        cur.execute("SELECT * FROM users WHERE username=%s;", (username,))
         user = cur.fetchone()
         cur.close()
         conn.close()
@@ -707,39 +347,22 @@ def login():
             flash("Usuario o contraseña incorrectos.", "danger")
             return render_template_string(
                 TPL_LOGIN,
-                flashes=get_flashed_messages(with_categories=True),
                 app_brand=APP_BRAND,
-                admin_whatsapp=ADMIN_WHATSAPP
+                flashes=get_flashed_messages(with_categories=True)
             )
 
         session["user_id"] = user["id"]
-        log_action(user["id"], "login", "Inicio de sesión")
-        flash(f"Bienvenido, {user['username']}", "success")
+        log_action(user["id"], "login")
         return redirect(url_for("index"))
 
     return render_template_string(
         TPL_LOGIN,
-        flashes=get_flashed_messages(with_categories=True),
         app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP
+        flashes=get_flashed_messages(with_categories=True)
     )
 
-
 # ============================================================
-#  BOTÓN CAMBIAR TEMA
-# ============================================================
-
-@app.route("/toggle-theme")
-@login_required
-def toggle_theme():
-    current = session.get("theme", "light")
-    session["theme"] = "dark" if current == "light" else "light"
-    ref = request.referrer or url_for("index")
-    return redirect(ref)
-
-
-# ============================================================
-#  DASHBOARD (INICIO)
+# DASHBOARD (INICIO)
 # ============================================================
 
 @app.route("/")
@@ -750,423 +373,124 @@ def index():
     cur = conn.cursor()
 
     # Total clientes visibles
-    if user["role"] == "cobrador":
-        cur.execute("SELECT COUNT(*) AS total FROM clients WHERE created_by = %s;", (user["id"],))
+    if user["rol"] == "cobrador":
+        cur.execute("SELECT COUNT(*) AS total FROM clients WHERE created_by=%s;",
+                    (user["id"],))
     else:
         cur.execute("SELECT COUNT(*) AS total FROM clients;")
     total_clients = cur.fetchone()["total"]
 
-    # Total préstamos visibles
-    if user["role"] == "cobrador":
-        cur.execute("SELECT COUNT(*) AS total FROM loans WHERE created_by = %s;", (user["id"],))
+    # Total préstamos
+    if user["rol"] == "cobrador":
+        cur.execute("""
+            SELECT COUNT(*) AS total
+            FROM loans
+            WHERE created_by=%s
+        """, (user["id"],))
     else:
         cur.execute("SELECT COUNT(*) AS total FROM loans;")
     total_loans = cur.fetchone()["total"]
 
-    # Préstamos activos + capital restante (baja cuando pagan capital)
-    if user["role"] == "cobrador":
+    # Activos + capital
+    if user["rol"] == "cobrador":
         cur.execute("""
-            SELECT COUNT(*) AS c, COALESCE(SUM(remaining),0) AS total_capital
+            SELECT COUNT(*) AS c,
+                   COALESCE(SUM(remaining),0) AS capital
             FROM loans
-            WHERE status = 'activo' AND created_by = %s;
+            WHERE status='activo' AND created_by=%s;
         """, (user["id"],))
     else:
         cur.execute("""
-            SELECT COUNT(*) AS c, COALESCE(SUM(remaining),0) AS total_capital
+            SELECT COUNT(*) AS c,
+                   COALESCE(SUM(remaining),0) AS capital
             FROM loans
-            WHERE status = 'activo';
+            WHERE status='activo';
         """)
     row = cur.fetchone()
     active_loans = row["c"]
-    active_capital = row["total_capital"]
+    active_capital = row["capital"]
 
-    # Últimos préstamos activos con cliente
-    if user["role"] == "cobrador":
+    # Últimos préstamos
+    if user["rol"] == "cobrador":
         cur.execute("""
-            SELECT l.id, l.amount, l.rate, l.frequency, l.start_date,
-                   c.first_name, c.last_name
+            SELECT l.*, c.first_name, c.last_name
             FROM loans l
-            JOIN clients c ON c.id = l.client_id
-            WHERE l.status = 'activo' AND l.created_by = %s
+            JOIN clients c ON c.id=l.client_id
+            WHERE l.created_by=%s
             ORDER BY l.id DESC
-            LIMIT 10;
+            LIMIT 10
         """, (user["id"],))
     else:
         cur.execute("""
-            SELECT l.id, l.amount, l.rate, l.frequency, l.start_date,
-                   c.first_name, c.last_name
+            SELECT l.*, c.first_name, c.last_name
             FROM loans l
-            JOIN clients c ON c.id = l.client_id
-            WHERE l.status = 'activo'
+            JOIN clients c ON c.id=l.client_id
             ORDER BY l.id DESC
-            LIMIT 10;
+            LIMIT 10
         """)
+
     last_loans = cur.fetchall()
 
     cur.close()
     conn.close()
 
-    # Filas de la tabla "Préstamos activos" con interés próximo
+    # Filas
     last_rows = ""
     for l in last_loans:
-        rate = float(l["rate"] or 0)
-        amount = float(l["amount"] or 0)
-        next_interest = amount * rate / 100.0  # interés del próximo período
-        freq_label = {
+        per_int = l["amount"] * l["rate"] / 100
+        freq_lbl = {
             "diario": "Diario",
             "semanal": "Semanal",
             "quincenal": "Quincenal",
-            "mensual": "Mensual",
+            "mensual": "Mensual"
         }.get(l["frequency"], l["frequency"])
         last_rows += f"""
         <tr>
-          <td>#{l['id']}</td>
-          <td>{l['first_name']} {l['last_name']}</td>
-          <td>{fmt_money(amount)}</td>
-          <td>{rate:.2f}% / {freq_label}</td>
-          <td>{l['start_date']}</td>
-          <td>{fmt_money(next_interest)}</td>
+            <td>{l['id']}</td>
+            <td>{l['first_name']} {l['last_name']}</td>
+            <td>{fmt_money(l['amount'])}</td>
+            <td>{l['rate']}% / {freq_lbl}</td>
+            <td>{l['start_date']}</td>
+            <td>{fmt_money(per_int)}</td>
         </tr>
         """
 
     body = f"""
-    <div class="hero-title">JDM Cash Now</div>
+    <h1>Bienvenido, {user['username']}</h1>
 
-    <div class="dashboard-grid">
-      <section class="card">
-        <h2>Préstamos activos</h2>
-        <p class="kpi-big">{active_loans}</p>
-        <p class="kpi-label">Últimos activos (con nombre del cliente):</p>
-
-        <div class="table-wrapper">
-          <table>
-            <thead>
-              <tr>
-                <th>#</th>
-                <th>Cliente</th>
-                <th>Capital</th>
-                <th>% / Frecuencia</th>
-                <th>Inicio</th>
-                <th>Interés próximo</th>
-              </tr>
-            </thead>
-            <tbody>
-              {last_rows}
-            </tbody>
-          </table>
-        </div>
-      </section>
-
-      <section class="card">
-        <h2>Capital prestado</h2>
-        <p class="kpi-big">{fmt_money(active_capital)}</p>
-        <p class="kpi-label">
-          Admin puede editar/eliminar cada préstamo desde
-          <a href="{url_for('loans')}">Préstamos</a>.
-        </p>
-        <p>
-          <a class="btn btn-primary" href="{url_for('loans')}">Ir a Préstamos</a>
-        </p>
-      </section>
+    <div class="card">
+        <h2>Resumen general</h2>
+        <p><b>Clientes:</b> {total_clients}</p>
+        <p><b>Préstamos:</b> {total_loans}</p>
+        <p><b>Préstamos activos:</b> {active_loans}</p>
+        <p><b>Capital activo:</b> {fmt_money(active_capital)}</p>
     </div>
 
-    <div class="dashboard-grid" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 18px;">
-      <section class="card">
-        <h3>Total clientes</h3>
-        <p class="kpi-big">{total_clients}</p>
-      </section>
-
-      <section class="card">
-        <h3>Total préstamos</h3>
-        <p class="kpi-big">{total_loans}</p>
-      </section>
+    <div class="card">
+        <h3>Últimos préstamos</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Cliente</th><th>Monto</th>
+                    <th>%</th><th>Inicio</th><th>Interés</th>
+                </tr>
+            </thead>
+            <tbody>{last_rows}</tbody>
+        </table>
     </div>
     """
 
     return render_template_string(
         TPL_LAYOUT,
+        app_brand=APP_BRAND,
         body=body,
         user=user,
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
         flashes=get_flashed_messages(with_categories=True),
         theme=get_theme()
     )
 
-
 # ============================================================
-#  USUARIOS
-# ============================================================
-
-@app.route("/users")
-@login_required
-@admin_required
-def users():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, role, created_at FROM users ORDER BY id DESC;")
-    rows = cur.fetchall()
-    cur.close()
-    conn.close()
-
-    users_html = "".join([
-        f"""
-        <tr>
-          <td>{u['id']}</td>
-          <td>{u['username']}</td>
-          <td>{u['role']}</td>
-          <td>{u['created_at']}</td>
-          <td>
-            <form action="{url_for('delete_user', user_id=u['id'])}" method="post" 
-                  onsubmit="return confirm('¿Eliminar usuario permanentemente?');" style="display:inline;">
-              <input name="pin" placeholder="PIN" required>
-              <button class="btn btn-danger">Eliminar</button>
-            </form>
-          </td>
-        </tr>
-        """
-        for u in rows
-    ])
-
-    body = f"""
-    <div class='card'>
-      <h2>Usuarios</h2>
-      <a href="{url_for('new_user')}" class="btn btn-primary">➕ Nuevo usuario</a>
-      <div class="table-wrapper">
-        <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Usuario</th><th>Rol</th><th>Creado</th><th></th>
-            </tr>
-          </thead>
-          <tbody>{users_html}</tbody>
-        </table>
-      </div>
-    </div>
-    """
-
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=current_user(),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
-        flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
-    )
-
-
-@app.route("/users/new", methods=["GET", "POST"])
-@login_required
-@admin_required
-def new_user():
-    if request.method == "POST":
-        username = request.form.get("username", "").strip()
-        password = request.form.get("password", "").strip()
-        role = request.form.get("role")
-        pin = request.form.get("pin")
-
-        if pin != ADMIN_PIN:
-            flash("PIN incorrecto.", "danger")
-            return redirect(url_for("new_user"))
-
-        if not username or not password:
-            flash("Datos incompletos.", "danger")
-            return redirect(url_for("new_user"))
-
-        pwd = generate_password_hash(password)
-
-        conn = get_conn()
-        cur = conn.cursor()
-        try:
-            cur.execute("""
-                INSERT INTO users (username, password_hash, role, created_at)
-                VALUES (%s, %s, %s, %s)
-            """, (username, pwd, role, datetime.utcnow()))
-            conn.commit()
-            flash("Usuario creado correctamente.", "success")
-        except psycopg2.errors.UniqueViolation:
-            conn.rollback()
-            flash("Ese usuario ya existe.", "danger")
-        finally:
-            cur.close()
-            conn.close()
-
-        return redirect(url_for("users"))
-
-    body = """
-    <div class='card'>
-      <h2>Crear usuario</h2>
-
-      <form method="post">
-        <label>Usuario</label>
-        <input name="username" required>
-
-        <label>Contraseña</label>
-        <input type="password" name="password" required>
-
-        <label>Rol</label>
-        <select name="role">
-          <option value="cobrador">Cobrador</option>
-          <option value="supervisor">Supervisor</option>
-          <option value="admin">Admin</option>
-        </select>
-
-        <label>PIN admin</label>
-        <input name="pin" required>
-
-        <button class="btn btn-primary" style="margin-top:10px;">Crear usuario</button>
-      </form>
-    </div>
-    """
-
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=current_user(),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
-        flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
-    )
-
-
-@app.route("/users/<int:user_id>/delete", methods=["POST"])
-@login_required
-@admin_required
-def delete_user(user_id):
-    pin = request.form.get("pin")
-    if pin != ADMIN_PIN:
-        flash("PIN incorrecto.", "danger")
-        return redirect(url_for("users"))
-
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM users WHERE id = %s AND role != 'admin';", (user_id,))
-
-    if cur.rowcount == 0:
-        flash("No se puede borrar un administrador.", "warning")
-    else:
-        flash("Usuario eliminado.", "success")
-
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    return redirect(url_for("users"))
-
-
-# ============================================================
-#  REASIGNACIÓN MASIVA DE CLIENTES ENTRE COBRADORES
-# ============================================================
-
-@app.route("/reassign", methods=["GET", "POST"])
-@login_required
-@admin_required
-def reassign_clients():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id, username FROM users WHERE role = 'cobrador';")
-    cobradores = cur.fetchall()
-
-    if request.method == "POST":
-        from_id = int(request.form.get("from_id"))
-        to_id = int(request.form.get("to_id"))
-
-        if from_id == to_id:
-            flash("No puedes reasignar al mismo cobrador.", "warning")
-            cur.close()
-            conn.close()
-            return redirect(url_for("reassign_clients"))
-
-        cur.execute("""
-            UPDATE clients
-            SET created_by = %s
-            WHERE created_by = %s;
-        """, (to_id, from_id))
-
-        cur.execute("""
-            UPDATE loans
-            SET created_by = %s
-            WHERE created_by = %s;
-        """, (to_id, from_id))
-
-        conn.commit()
-
-        flash("Clientes y préstamos reasignados exitosamente.", "success")
-        cur.close()
-        conn.close()
-        return redirect(url_for("reassign_clients"))
-
-    cur.close()
-    conn.close()
-
-    opts = "".join([f"<option value='{c['id']}'>{c['username']}</option>" for c in cobradores])
-
-    body = f"""
-    <div class='card'>
-      <h2>Reasignar clientes entre cobradores</h2>
-
-      <form method="post">
-        <label>Cobrador ORIGEN (quien pierde los clientes)</label>
-        <select name="from_id" required>{opts}</select>
-
-        <label>Cobrador DESTINO (quien recibirá los clientes)</label>
-        <select name="to_id" required>{opts}</select>
-
-        <button class="btn btn-primary" style="margin-top:10px;">Reasignar</button>
-      </form>
-    </div>
-    """
-
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=current_user(),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
-        flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
-    )
-
-
-# ============================================================
-#  REASIGNAR UN SOLO CLIENTE A OTRO COBRADOR
-# ============================================================
-
-@app.route("/clients/<int:client_id>/reassign", methods=["POST"])
-@login_required
-@role_required("admin", "supervisor")
-def reassign_single_client(client_id):
-    new_user_id = request.form.get("new_user_id", type=int)
-    if not new_user_id:
-        flash("Seleccione un cobrador destino.", "danger")
-        return redirect(url_for("client_detail", client_id=client_id))
-
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT id FROM users WHERE id=%s AND role='cobrador';", (new_user_id,))
-    row = cur.fetchone()
-    if not row:
-        flash("Cobrador destino inválido.", "danger")
-        cur.close()
-        conn.close()
-        return redirect(url_for("client_detail", client_id=client_id))
-
-    cur.execute("UPDATE clients SET created_by=%s WHERE id=%s;", (new_user_id, client_id))
-    cur.execute("UPDATE loans SET created_by=%s WHERE client_id=%s;", (new_user_id, client_id))
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    flash("Cliente y sus préstamos fueron movidos al nuevo cobrador.", "success")
-    return redirect(url_for("client_detail", client_id=client_id))
-
-
-# ============================================================
-#  CLIENTES
+# CLIENTES — LISTA
 # ============================================================
 
 @app.route("/clients")
@@ -1177,10 +501,11 @@ def clients():
     conn = get_conn()
     cur = conn.cursor()
 
-    if user["role"] == "cobrador":
+    if user["rol"] == "cobrador":
         cur.execute("""
-            SELECT * FROM clients
-            WHERE created_by = %s
+            SELECT *
+            FROM clients
+            WHERE created_by=%s
             ORDER BY id DESC
         """, (user["id"],))
     else:
@@ -1190,51 +515,48 @@ def clients():
     cur.close()
     conn.close()
 
-    body_rows = "".join([
+    html_rows = "".join([
         f"""
         <tr>
-          <td>{c['id']}</td>
-          <td>{c['first_name']} {c['last_name']}</td>
-          <td>{c['phone']}</td>
-          <td>{c['address']}</td>
-          <td>{c.get('route') or ''}</td>
-          <td>{c['created_at']}</td>
-          <td>
-            <a class="btn btn-secondary" href="{url_for('client_detail', client_id=c['id'])}">Ver</a>
-          </td>
+            <td>{c['id']}</td>
+            <td>{c['first_name']} {c['last_name']}</td>
+            <td>{c['phone']}</td>
+            <td>{c['address']}</td>
+            <td>{c.get('route','')}</td>
+            <td>{c['created_at']}</td>
+            <td>
+                <a class='btn btn-secondary' href='/clients/{c['id']}'>Ver</a>
+            </td>
         </tr>
         """ for c in rows
     ])
 
     body = f"""
     <div class="card">
-      <h2>Clientes</h2>
-      <a class="btn btn-primary" href="{url_for('new_client')}">➕ Nuevo cliente</a>
+        <h2>Clientes</h2>
+        <a href="/clients/new" class="btn btn-primary">➕ Nuevo cliente</a>
 
-      <div class="table-wrapper">
         <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Nombre</th><th>Teléfono</th>
-              <th>Dirección</th><th>Ruta</th><th>Creado</th><th></th>
-            </tr>
-          </thead>
-          <tbody>{body_rows}</tbody>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Nombre</th><th>Teléfono</th>
+                    <th>Dirección</th><th>Ruta</th><th>Creado</th><th></th>
+                </tr>
+            </thead>
+            <tbody>{html_rows}</tbody>
         </table>
-      </div>
     </div>
     """
 
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
+        TPL_LAYOUT, body=body, user=user, app_brand=APP_BRAND,
         flashes=get_flashed_messages(with_categories=True),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
         theme=get_theme()
     )
 
+# ============================================================
+# NUEVO CLIENTE
+# ============================================================
 
 @app.route("/clients/new", methods=["GET", "POST"])
 @login_required
@@ -1242,12 +564,12 @@ def new_client():
     user = current_user()
 
     if request.method == "POST":
-        first = request.form.get("first_name", "").strip()
-        last = request.form.get("last_name", "").strip()
-        phone = request.form.get("phone", "").strip()
-        address = request.form.get("address", "").strip()
-        docid = request.form.get("document_id", "").strip()
-        route = request.form.get("route", "").strip()
+        first = request.form.get("first_name").strip()
+        last = request.form.get("last_name").strip()
+        phone = request.form.get("phone").strip()
+        address = request.form.get("address").strip()
+        docid = request.form.get("document_id").strip()
+        route = request.form.get("route").strip()
 
         if not first:
             flash("El nombre es obligatorio.", "danger")
@@ -1263,221 +585,242 @@ def new_client():
         cur.close()
         conn.close()
 
-        flash("Cliente agregado.", "success")
+        flash("Cliente creado correctamente.", "success")
         return redirect(url_for("clients"))
 
     body = """
     <div class="card">
-      <h2>Nuevo cliente</h2>
-
-      <form method="post">
-        <label>Nombre</label>
-        <input required name="first_name">
-
-        <label>Apellido</label>
-        <input name="last_name">
-
-        <label>Documento</label>
-        <input name="document_id">
-
-        <label>Teléfono</label>
-        <input name="phone">
-
-        <label>Dirección</label>
-        <input name="address">
-
-        <label>Ruta (zona / sector)</label>
-        <input name="route">
-
-        <button class="btn btn-primary" style="margin-top:10px;">Guardar</button>
-      </form>
+        <h2>Nuevo cliente</h2>
+        <form method="post">
+            <label>Nombre</label><input name="first_name" required>
+            <label>Apellido</label><input name="last_name">
+            <label>Documento</label><input name="document_id">
+            <label>Teléfono</label><input name="phone">
+            <label>Dirección</label><input name="address">
+            <label>Ruta</label><input name="route">
+            <button class="btn btn-primary" style="margin-top:12px;">Guardar</button>
+        </form>
     </div>
     """
 
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
+        TPL_LAYOUT, body=body, user=user, app_brand=APP_BRAND,
         flashes=get_flashed_messages(with_categories=True),
-        admin_whatsapp=ADMIN_WHATSAPP,
-        app_brand=APP_BRAND,
         theme=get_theme()
     )
 
+# ============================================================
+# DETALLE DEL CLIENTE
+# ============================================================
 
 @app.route("/clients/<int:client_id>")
 @login_required
 def client_detail(client_id):
     user = current_user()
+
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("SELECT * FROM clients WHERE id=%s", (client_id,))
     client = cur.fetchone()
 
     if not client:
         flash("Cliente no encontrado.", "danger")
-        cur.close()
-        conn.close()
         return redirect(url_for("clients"))
 
-    if user["role"] == "cobrador" and client["created_by"] != user["id"]:
-        flash("No tienes permiso para este cliente.", "danger")
-        cur.close()
-        conn.close()
+    # Seguridad cobrador
+    if user["rol"] == "cobrador" and client["created_by"] != user["id"]:
+        flash("No tiene permiso para ver este cliente.", "danger")
         return redirect(url_for("clients"))
 
+    # Préstamos del cliente
     cur.execute("""
-        SELECT id, amount, remaining, rate, frequency, start_date, total_interest_paid, status, term_count
+        SELECT *
         FROM loans
         WHERE client_id=%s
         ORDER BY id DESC
     """, (client_id,))
     loans = cur.fetchall()
 
-    # Para mover un solo cliente a otro cobrador
+    loans_html = "".join([
+        f"""
+        <tr>
+            <td>{l['id']}</td>
+            <td>{fmt_money(l['amount'])}</td>
+            <td>{fmt_money(l['remaining'])}</td>
+            <td>{l['rate']}%</td>
+            <td>{l['frequency']}</td>
+            <td>{l['start_date']}</td>
+            <td>{l['status']}</td>
+            <td><a class='btn btn-secondary' href='/loan/{l['id']}'>Ver</a></td>
+        </tr>
+        """ for l in loans
+    ])
+
+    # Reasignación a cobrador
     reassign_block = ""
-    if user["role"] in ("admin", "supervisor"):
-        cur.execute("SELECT id, username FROM users WHERE role='cobrador' ORDER BY username;")
+    if user["rol"] in ("admin", "supervisor"):
+        cur.execute("SELECT id, username FROM users WHERE rol='cobrador'")
         cobradores = cur.fetchall()
-        options = "".join([
-            f"<option value='{u['id']}'>{u['username']}</option>"
-            for u in cobradores
-        ])
+
+        opts = "".join([f"<option value='{u['id']}'>{u['username']}</option>"
+                        for u in cobradores])
+
         reassign_block = f"""
-        <form method="post" action="{url_for('reassign_single_client', client_id=client_id)}" style="margin-top:10px;">
-          <label>Reasignar a cobrador:</label>
-          <select name="new_user_id" required>
-            <option value="">--Seleccione--</option>
-            {options}
-          </select>
-          <button class="btn btn-primary" style="margin-left:8px;">Mover cliente</button>
+        <form method='post' action='/clients/{client_id}/reassign'>
+            <label>Reasignar a cobrador:</label>
+            <select name='new_user_id'>{opts}</select>
+            <button class='btn btn-primary'>Mover</button>
         </form>
         """
 
     cur.close()
     conn.close()
 
-    loans_html = "".join([
-        f"""
-        <tr>
-          <td>{l['id']}</td>
-          <td>{fmt_money(l['amount'])}</td>
-          <td>{fmt_money(l['remaining'])}</td>
-          <td>{l['rate']}%</td>
-          <td>{l['frequency']}</td>
-          <td>{l['start_date']}</td>
-          <td>{fmt_money(l.get('total_interest_paid', 0))}</td>
-          <td>{l.get('status', 'activo')}</td>
-          <td>
-            <a class="btn btn-secondary" href="{url_for('loan_detail', loan_id=l['id'])}">Ver</a>
-          </td>
-        </tr>
-        """
-        for l in loans
-    ])
-
-    delete_block = ""
-    if user["role"] == "admin":
-        delete_block = f"""
-        <form method="post" action="{url_for('delete_client', client_id=client_id)}"
-              onsubmit="return confirm('¿Eliminar cliente con todos préstamos?');">
-          <input name="pin" placeholder="PIN" required>
-          <button class="btn btn-danger">Eliminar cliente</button>
-        </form>
-        """
-
     body = f"""
-    <div class="card">
-      <h2>Cliente {client['first_name']} {client['last_name']}</h2>
-      <p>Tel: {client['phone']}</p>
-      <p>Dirección: {client['address']}</p>
-      <p>Documento: {client['document_id']}</p>
-      <p>Ruta: {client.get('route') or ''}</p>
-      {delete_block}
-      {reassign_block}
+    <div class='card'>
+        <h2>Cliente: {client['first_name']} {client['last_name']}</h2>
+        <p><b>Teléfono:</b> {client['phone']}</p>
+        <p><b>Dirección:</b> {client['address']}</p>
+        <p><b>Documento:</b> {client['document_id']}</p>
+        <p><b>Ruta:</b> {client['route']}</p>
+        {reassign_block}
     </div>
 
-    <div class="card">
-      <h3>Préstamos</h3>
-      <a class="btn btn-primary" href="/loans/new?client_id={client_id}">➕ Nuevo préstamo</a>
+    <div class='card'>
+        <h3>Préstamos</h3>
+        <a href='/loans/new?client_id={client_id}' class='btn btn-primary'>➕ Nuevo préstamo</a>
 
-      <div class="table-wrapper">
         <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Monto</th><th>Restante</th>
-              <th>%</th><th>Frecuencia</th><th>Inicio</th>
-              <th>Interés pagado</th><th>Estado</th><th></th>
-            </tr>
-          </thead>
-          <tbody>
-            {loans_html}
-          </tbody>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Monto</th><th>Restante</th>
+                    <th>%</th><th>Freq</th><th>Inicio</th><th>Estado</th><th></th>
+                </tr>
+            </thead>
+            <tbody>{loans_html}</tbody>
         </table>
-      </div>
     </div>
     """
 
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        admin_whatsapp=ADMIN_WHATSAPP,
-        app_brand=APP_BRAND,
+        TPL_LAYOUT, body=body, user=user, app_brand=APP_BRAND,
         flashes=get_flashed_messages(with_categories=True),
         theme=get_theme()
     )
 
+# ============================================================
+# REASIGNAR UN CLIENTE
+# ============================================================
 
-@app.route("/clients/<int:client_id>/delete", methods=["POST"])
+@app.route("/clients/<int:client_id>/reassign", methods=["POST"])
 @login_required
-@admin_required
-def delete_client(client_id):
-    pin = request.form.get("pin")
-    if pin != ADMIN_PIN:
-        flash("PIN incorrecto.", "danger")
-        return redirect(url_for("client_detail", client_id=client_id))
+def reassign_single_client(client_id):
+    user = current_user()
+    if user["rol"] not in ("admin", "supervisor"):
+        flash("No tiene permiso.", "danger")
+        return redirect(url_for("clients"))
+
+    new_uid = request.form.get("new_user_id")
 
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM clients WHERE id=%s", (client_id,))
+
+    cur.execute("UPDATE clients SET created_by=%s WHERE id=%s",
+                (new_uid, client_id))
+    cur.execute("UPDATE loans SET created_by=%s WHERE client_id=%s",
+                (new_uid, client_id))
+
     conn.commit()
     cur.close()
     conn.close()
 
-    flash("Cliente eliminado.", "success")
-    return redirect(url_for("clients"))
-
+    flash("Cliente reasignado correctamente.", "success")
+    return redirect(url_for("client_detail", client_id=client_id))
 
 # ============================================================
-#  PRÉSTAMOS LISTA + CREAR
+# REASIGNACIÓN MASIVA ENTRE COBRADORES
+# ============================================================
+
+@app.route("/reassign", methods=["GET", "POST"])
+@login_required
+@admin_required
+def reassign_clients():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT id, username FROM users WHERE rol='cobrador'")
+    cobradores = cur.fetchall()
+
+    if request.method == "POST":
+        from_id = int(request.form.get("from_id"))
+        to_id = int(request.form.get("to_id"))
+
+        if from_id == to_id:
+            flash("No puede reasignar al mismo cobrador.", "warning")
+            return redirect(url_for("reassign_clients"))
+
+        cur.execute("UPDATE clients SET created_by=%s WHERE created_by=%s",
+                    (to_id, from_id))
+        cur.execute("UPDATE loans SET created_by=%s WHERE created_by=%s",
+                    (to_id, from_id))
+        conn.commit()
+        flash("Reasignación completada.", "success")
+        return redirect(url_for("reassign_clients"))
+
+    # Render
+    options = "".join([
+        f"<option value='{c['id']}'>{c['username']}</option>"
+        for c in cobradores
+    ])
+
+    body = f"""
+    <div class='card'>
+        <h2>Reasignar clientes entre cobradores</h2>
+        <form method='post'>
+            <label>Cobrador origen</label>
+            <select name='from_id'>{options}</select>
+
+            <label>Cobrador destino</label>
+            <select name='to_id'>{options}</select>
+
+            <button class='btn btn-primary' style='margin-top:12px;'>Reasignar</button>
+        </form>
+    </div>
+    """
+
+    cur.close()
+    conn.close()
+
+    return render_template_string(
+        TPL_LAYOUT, body=body, user=current_user(),
+        app_brand=APP_BRAND,
+        flashes=get_flashed_messages(with_categories=True),
+        theme=get_theme()
+    )
+# ============================================================
+# LISTA DE PRÉSTAMOS
 # ============================================================
 
 @app.route("/loans")
 @login_required
 def loans():
     user = current_user()
+
     conn = get_conn()
     cur = conn.cursor()
 
-    if user["role"] == "cobrador":
+    if user["rol"] == "cobrador":
         cur.execute("""
-            SELECT l.id, l.amount, l.remaining, l.rate, l.frequency,
-                   l.start_date, l.total_interest_paid, l.status, l.term_count,
-                   c.first_name, c.last_name
+            SELECT l.*, c.first_name, c.last_name
             FROM loans l
-            JOIN clients c ON c.id = l.client_id
-            WHERE l.created_by = %s
+            JOIN clients c ON c.id=l.client_id
+            WHERE l.created_by=%s
             ORDER BY l.id DESC
         """, (user["id"],))
     else:
         cur.execute("""
-            SELECT l.id, l.amount, l.remaining, l.rate, l.frequency,
-                   l.start_date, l.total_interest_paid, l.status, l.term_count,
-                   c.first_name, c.last_name
+            SELECT l.*, c.first_name, c.last_name
             FROM loans l
-            JOIN clients c ON c.id = l.client_id
+            JOIN clients c ON c.id=l.client_id
             ORDER BY l.id DESC
         """)
 
@@ -1485,123 +828,169 @@ def loans():
     cur.close()
     conn.close()
 
-    html_rows = "".join([
+    html = "".join([
         f"""
         <tr>
-          <td>{l['id']}</td>
-          <td>{l['first_name']} {l['last_name']}</td>
-          <td>{fmt_money(l['amount'])}</td>
-          <td>{fmt_money(l['remaining'])}</td>
-          <td>{l['rate']}%</td>
-          <td>{l['frequency']}</td>
-          <td>{l['start_date']}</td>
-          <td>{fmt_money(l.get('total_interest_paid', 0))}</td>
-          <td>{l.get('status', 'activo')}</td>
-          <td>
-            <a class="btn btn-secondary" href="{url_for('loan_detail', loan_id=l['id'])}">Ver</a>
-          </td>
+            <td>{l['id']}</td>
+            <td>{l['first_name']} {l['last_name']}</td>
+            <td>{fmt_money(l['amount'])}</td>
+            <td>{fmt_money(l['remaining'])}</td>
+            <td>{l['rate']}%</td>
+            <td>{l['frequency']}</td>
+            <td>{l['start_date']}</td>
+            <td>{l['status']}</td>
+            <td><a class='btn btn-secondary' href='/loan/{l['id']}'>Ver</a></td>
         </tr>
-        """ for l in rows
+        """
+        for l in rows
     ])
 
     body = f"""
-    <div class="card">
-      <h2>Préstamos</h2>
-      <a class="btn btn-primary" href="{url_for('new_loan')}">➕ Nuevo préstamo</a>
+    <div class='card'>
+        <h2>Préstamos</h2>
+        <a href='/loans/new' class='btn btn-primary'>➕ Crear préstamo</a>
 
-      <div class="table-wrapper">
         <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Cliente</th><th>Capital</th><th>Restante</th>
-              <th>%</th><th>Frecuencia</th><th>Inicio</th>
-              <th>Interés pagado</th><th>Estado</th><th></th>
-            </tr>
-          </thead>
-          <tbody>{html_rows}</tbody>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Cliente</th><th>Monto</th>
+                    <th>Restante</th><th>%</th><th>Freq</th>
+                    <th>Inicio</th><th>Estado</th><th></th>
+                </tr>
+            </thead>
+            <tbody>{html}</tbody>
         </table>
-      </div>
     </div>
     """
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        flashes=get_flashed_messages(with_categories=True),
-        admin_whatsapp=ADMIN_WHATSAPP,
-        app_brand=APP_BRAND,
-        theme=get_theme()
-    )
+
+    return render_template_string(TPL_LAYOUT, body=body, user=user,
+                                  flashes=get_flashed_messages(with_categories=True),
+                                  app_brand=APP_BRAND, theme=get_theme())
 
 
-@app.route("/new-loan", methods=["POST"])
+# ============================================================
+# FORMULARIO NUEVO PRÉSTAMO (GET)
+# ============================================================
+
+@app.route("/loans/new", methods=["GET"])
+@login_required
+def new_loan_form():
+    client_id = request.args.get("client_id", "")
+
+    body = f"""
+    <div class='card'>
+        <h2>Nuevo Préstamo</h2>
+
+        <form method='post' action='/loans/new'>
+            <label>ID Cliente</label>
+            <input name='client_id' value='{client_id}' required>
+
+            <label>Monto prestado</label>
+            <input type='number' name='amount' step='0.01' required>
+
+            <label>Interés (%)</label>
+            <input type='number' name='rate' step='0.01' required>
+
+            <label>Frecuencia</label>
+            <select name='frequency' required>
+                <option value='diario'>Diario</option>
+                <option value='semanal'>Semanal</option>
+                <option value='quincenal'>Quincenal</option>
+                <option value='mensual'>Mensual</option>
+            </select>
+
+            <label>Fecha inicio</label>
+            <input type='date' name='start_date' value='{date.today()}' required>
+
+            <label>Cantidad de períodos</label>
+            <input type='number' name='term_count' required>
+
+            <label>Tipo de período</label>
+            <select name='term_kind'>
+                <option value='dias'>Días</option>
+                <option value='semanas'>Semanas</option>
+            </select>
+
+            <label>Fee (%)</label>
+            <input type='number' name='fee_percent' value='10' step='0.01' required>
+
+            <button class='btn btn-primary' style='margin-top:12px;'>Crear préstamo</button>
+        </form>
+    </div>
+    """
+
+    return render_template_string(TPL_LAYOUT, body=body,
+                                  user=current_user(), app_brand=APP_BRAND,
+                                  flashes=get_flashed_messages(with_categories=True),
+                                  theme=get_theme())
+
+
+# ============================================================
+# NUEVO PRÉSTAMO (POST)
+# ============================================================
+
+@app.route("/loans/new", methods=["POST"])
+@login_required
 def new_loan():
-    if "user" not in session:
-        return redirect(url_for("login"))
-
-    user = session["user"]
+    user = current_user()
 
     client_id = request.form.get("client_id")
     amount = float(request.form.get("amount"))
-    rate = float(request.form.get("rate") or 0)
+    rate = float(request.form.get("rate"))
     freq = request.form.get("frequency")
     start_date = request.form.get("start_date")
     term_count = int(request.form.get("term_count"))
     term_kind = request.form.get("term_kind")
     fee_percent = float(request.form.get("fee_percent"))
 
-    # === Validación del fee ===
+    # Fee solo editable por el admin
     if user["rol"] != "admin" and fee_percent <= 0:
-        flash("❌ Solo el admin puede poner fee 0%.", "error")
+        flash("Solo el administrador puede poner fee 0%.", "danger")
         return redirect(url_for("new_loan_form"))
 
-    # === Cálculo del fee y desembolso ===
-    fee_amount = (amount * fee_percent) / 100
+    # Fee
+    fee_amount = amount * fee_percent / 100
     disbursement = amount - fee_amount
 
-    # === Calcular fecha final automática ===
-    start = datetime.strptime(start_date, "%Y-%m-%d").date()
-
+    # Fecha final automática
+    s = datetime.strptime(start_date, "%Y-%m-%d").date()
     if term_kind == "dias":
-        auto_end_date = start + timedelta(days=term_count)
-    else:  # semanas
-        auto_end_date = start + timedelta(weeks=term_count)
+        auto_end_date = s + timedelta(days=term_count)
+    else:
+        auto_end_date = s + timedelta(weeks=term_count)
 
-    # === Insertar préstamo ===
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
         INSERT INTO loans (
-            client_id, amount, rate, frequency,
-            start_date, created_by, remaining,
-            total_interest_paid, status, term_count,
-            end_date, fee_percent, fee_amount,
+            client_id, amount, rate, frequency, start_date,
+            created_by, remaining, total_interest_paid, status,
+            term_count, end_date, fee_percent, fee_amount,
             disbursement, auto_end_date
         )
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'activo',%s,%s,%s,%s,%s,%s)
         RETURNING id;
     """, (
-        client_id, amount, rate, freq,
-        start_date, user["id"], amount,
-        0, "activo", term_count,
-        auto_end_date, fee_percent,
-        fee_amount, disbursement,
-        auto_end_date
+        client_id, amount, rate, freq, start_date,
+        user["id"], amount, 0,
+        term_count, auto_end_date, fee_percent,
+        fee_amount, disbursement, auto_end_date
     ))
 
     loan_id = cur.fetchone()["id"]
+
     conn.commit()
     cur.close()
     conn.close()
 
-    flash("✅ Préstamo creado correctamente", "success")
+    flash("Préstamo creado exitosamente.", "success")
     return redirect(url_for("loan_detail", loan_id=loan_id))
 
-# ============================================================
-#  DETALLE DE PRÉSTAMO + PAGOS
-# ============================================================
 
+# ============================================================
+# DETALLE DEL PRÉSTAMO
+# ============================================================
 
 @app.route("/loan/<int:loan_id>")
 @login_required
@@ -1611,126 +1000,105 @@ def loan_detail(loan_id):
     conn = get_conn()
     cur = conn.cursor()
 
-    # Obtener préstamo
     cur.execute("""
         SELECT l.*, c.first_name, c.last_name, c.phone
         FROM loans l
-        JOIN clients c ON c.id = l.client_id
+        JOIN clients c ON c.id=l.client_id
         WHERE l.id=%s
     """, (loan_id,))
     loan = cur.fetchone()
 
     if not loan:
         flash("Préstamo no encontrado.", "danger")
-        cur.close()
-        conn.close()
         return redirect(url_for("loans"))
 
-    # Cobrador solo puede ver los suyos
-    if user["role"] == "cobrador" and loan["created_by"] != user["id"]:
-        flash("No tienes permiso para ver este préstamo.", "danger")
-        cur.close()
-        conn.close()
+    # Seguridad cobrador
+    if user["rol"] == "cobrador" and loan["created_by"] != user["id"]:
+        flash("No tiene permiso.", "danger")
         return redirect(url_for("loans"))
 
-    # Obtener pagos del préstamo
-    cur.execute("""
-        SELECT *
-        FROM payments
-        WHERE loan_id=%s
-        ORDER BY id DESC
-    """, (loan_id,))
+    # Cálculos
+    per_interest = loan["amount"] * loan["rate"] / 100
+    total_interest = per_interest * loan["term_count"]
+    total_to_pay = loan["amount"] + total_interest
+    installment = total_to_pay / loan["term_count"]
+
+    # Pagos
+    cur.execute("SELECT * FROM payments WHERE loan_id=%s ORDER BY id DESC", (loan_id,))
     payments = cur.fetchall()
 
-    # ===== Cálculo de cuotas y totales =====
-    term_count = int(loan.get("term_count") or 0)
-    amount = float(loan["amount"] or 0)
-    rate = float(loan["rate"] or 0)
+    total_paid = sum(float(p["amount"]) for p in payments)
+    remaining_total = max(total_to_pay - total_paid, 0)
 
-    per_interest = amount * rate / 100.0
-    total_interest = per_interest * term_count
-    total_to_pay = amount + total_interest
-    installment = total_to_pay / term_count if term_count > 0 else 0.0
-
-    total_pagado = sum(float(p.get("amount") or 0) for p in payments)
-    cuotas_pagadas = min(int(total_pagado // installment if installment else 0), term_count)
-    restante_total = max(0.0, total_to_pay - total_pagado)
-
-    # ===== Cálculo de fecha final =====
-    start_date = loan.get("start_date")
-    freq = loan.get("frequency")
-
-    days_per = 7
-    if freq == "diario":
-        days_per = 1
-    elif freq == "quincenal":
-        days_per = 14
-    elif freq == "mensual":
-        days_per = 30
-
-    if isinstance(start_date, date):
-        end_date = start_date + timedelta(days=days_per * term_count)
-        end_date_str = end_date.strftime("%Y-%m-%d")
-    else:
-        end_date_str = "N/A"
-
-    # ===== Botón para WhatsApp factura =====
-    client_phone = (loan.get("phone") or "").strip()
-    wa_msg = (
-        f"Factura préstamo #{loan_id}%0A"
-        f"Cliente: {loan['first_name']} {loan['last_name']}%0A"
-        f"Monto: {fmt_money(amount)}%0A"
-        f"Interés: {rate}% %0A"
-        f"Total a pagar: {fmt_money(total_to_pay)}%0A"
-        f"Pago por período: {fmt_money(installment)}%0A"
-        f"Fecha final estimada: {end_date_str}"
-    )
-
+    phone = (loan["phone"] or "").replace(" ", "")
     wa_url = ""
-    if client_phone:
-        wa_url = f"https://wa.me/{client_phone}?text={wa_msg}"
-
-    # ===== HTML =====
-    body = f"""
-    <div class="card">
-        <h2>Detalles del préstamo #{loan_id}</h2>
-
-        <p><b>Cliente:</b> {loan['first_name']} {loan['last_name']}</p>
-        <p><b>Monto prestado:</b> {fmt_money(amount)}</p>
-        <p><b>Interés %:</b> {loan['rate']}%</p>
-        <p><b>Total a pagar:</b> {fmt_money(total_to_pay)}</p>
-        <p><b>Pago por período:</b> {fmt_money(installment)}</p>
-        <p><b>Cuotas pagadas:</b> {cuotas_pagadas}/{term_count}</p>
-        <p><b>Restante total:</b> {fmt_money(restante_total)}</p>
-        <p><b>Fecha final estimada:</b> {end_date_str}</p>
-
-        <hr>
-
-        <h3>Enviar factura al cliente</h3>
-        {"<a class='btn btn-primary' target='_blank' href='" + wa_url + "'>📲 Enviar por WhatsApp</a>" if wa_url else "<p>El cliente no tiene número registrado.</p>"}
-
-        <hr>
-
-        <h3>Pagos recibidos</h3>
-        <table class="table">
-            <tr>
-                <th>ID</th>
-                <th>Fecha</th>
-                <th>Monto</th>
-            </tr>
-            {"".join([
-                f"<tr><td>{p['id']}</td><td>{p['created_at']}</td><td>{fmt_money(p['amount'])}</td></tr>"
-            for p in payments])}
-        </table>
-
-        <a class="btn btn-secondary" href="/loans">Volver</a>
-    </div>
-    """
+    if phone:
+        msg = (
+            f"Factura préstamo #{loan_id}%0A"
+            f"Monto: {fmt_money(loan['amount'])}%0A"
+            f"Interés: {loan['rate']}%%0A"
+            f"Total a pagar: {fmt_money(total_to_pay)}%0A"
+            f"Cuota: {fmt_money(installment)}%0A"
+            f"Fecha final: {loan['auto_end_date']}"
+        )
+        wa_url = f"https://wa.me/{phone}?text={msg}"
 
     cur.close()
     conn.close()
-    return render_template_string(body)
 
+    pay_rows = "".join([
+        f"""
+        <tr>
+            <td>{p['id']}</td>
+            <td>{p['date']}</td>
+            <td>{fmt_money(p['amount'])}</td>
+            <td>{p['type']}</td>
+        </tr>
+        """ for p in payments
+    ])
+
+    body = f"""
+    <div class='card'>
+        <h2>Préstamo #{loan_id}</h2>
+
+        <p><b>Cliente:</b> {loan['first_name']} {loan['last_name']}</p>
+        <p><b>Monto prestado:</b> {fmt_money(loan['amount'])}</p>
+        <p><b>Total a pagar:</b> {fmt_money(total_to_pay)}</p>
+        <p><b>Interés:</b> {fmt_money(per_interest)} por período</p>
+        <p><b>Cuota:</b> {fmt_money(installment)}</p>
+        <p><b>Restante total:</b> {fmt_money(remaining_total)}</p>
+        <p><b>Fecha final:</b> {loan['auto_end_date']}</p>
+
+        <h3>Enviar factura</h3>
+        { f"<a class='btn btn-primary' target='_blank' href='{wa_url}'>📲 WhatsApp</a>" if wa_url else "<p>Cliente sin teléfono válido.</p>" }
+
+        <hr>
+        <h3>Pagos</h3>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Fecha</th><th>Monto</th><th>Tipo</th>
+                </tr>
+            </thead>
+            <tbody>{pay_rows}</tbody>
+        </table>
+
+        <a href='/loan/{loan_id}/payment/new' class='btn btn-primary'>➕ Registrar pago</a>
+    </div>
+    """
+
+    return render_template_string(
+        TPL_LAYOUT, body=body, user=user,
+        app_brand=APP_BRAND,
+        flashes=get_flashed_messages(with_categories=True),
+        theme=get_theme()
+    )
+
+
+# ============================================================
+# REGISTRAR PAGO
+# ============================================================
 
 @app.route("/loan/<int:loan_id>/payment/new", methods=["GET", "POST"])
 @login_required
@@ -1740,151 +1108,73 @@ def new_payment(loan_id):
     conn = get_conn()
     cur = conn.cursor()
 
-    # Obtener préstamo
-    cur.execute("""
-        SELECT l.*, c.first_name, c.last_name
-        FROM loans l
-        JOIN clients c ON c.id = l.client_id
-        WHERE l.id=%s
-    """, (loan_id,))
+    cur.execute("SELECT * FROM loans WHERE id=%s", (loan_id,))
     loan = cur.fetchone()
 
     if not loan:
         flash("Préstamo no encontrado.", "danger")
-        cur.close()
-        conn.close()
-        return redirect(url_for("loans"))
-
-    if user["role"] == "cobrador" and loan["created_by"] != user["id"]:
-        flash("No tienes permiso para este préstamo.", "danger")
-        cur.close()
-        conn.close()
         return redirect(url_for("loans"))
 
     if request.method == "POST":
-        amount = request.form.get("amount", type=float)
-        pay_type = request.form.get("type")  # "capital" / "interes" / "cuota"
-        note = request.form.get("note", "")
+        amount = float(request.form.get("amount"))
+        type_ = request.form.get("type")
+        note = request.form.get("note")
         date_str = request.form.get("date")
 
-        if not amount or amount <= 0 or pay_type not in ("capital", "interes", "cuota"):
-            flash("Datos de pago inválidos.", "danger")
-            cur.close()
-            conn.close()
-            return redirect(url_for("new_payment", loan_id=loan_id))
+        pay_date = datetime.strptime(date_str, "%Y-%m-%d").date()
 
-        try:
-            pay_date = datetime.strptime(date_str, "%Y-%m-%d").date()
-        except (TypeError, ValueError):
-            pay_date = date.today()
-
-        # Insertar pago
         cur.execute("""
             INSERT INTO payments (loan_id, amount, type, note, date, created_by)
             VALUES (%s,%s,%s,%s,%s,%s)
-        """, (loan_id, amount, pay_type, note, pay_date, user["id"]))
+        """, (loan_id, amount, type_, note, pay_date, user["id"]))
 
-        # Valores actuales para remaining / interés
-        current_remaining = float(loan["remaining"] or 0)
-        total_interest_paid = float(loan["total_interest_paid"] or 0)
+        # Cierre
+        per_int = loan["amount"] * loan["rate"] / 100
+        total_interest = per_int * loan["term_count"]
+        total_to_pay = loan["amount"] + total_interest
 
-        # Actualizar préstamo según tipo de pago
-        if pay_type == "capital":
-            new_remaining = current_remaining - amount
-            if new_remaining < 0:
-                new_remaining = 0.0
-            cur.execute("""
-                UPDATE loans
-                SET remaining = %s
-                WHERE id = %s
-            """, (new_remaining, loan_id))
-            current_remaining = new_remaining
-        elif pay_type == "interes":
-            total_interest_paid += amount
-            cur.execute("""
-                UPDATE loans
-                SET total_interest_paid = %s
-                WHERE id = %s
-            """, (total_interest_paid, loan_id))
-        # pay_type == "cuota": no tocamos remaining ni total_interest_paid directamente
+        cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM payments WHERE loan_id=%s",
+                    (loan_id,))
+        total_paid = float(cur.fetchone()["s"])
 
-        # ===== Cerrar préstamo automáticamente si se pagó todo el total (capital + interés) =====
-        amount_capital = float(loan["amount"] or 0)
-        rate = float(loan["rate"] or 0)
-        term_count = loan.get("term_count") or 0
-        try:
-            term_count_int = int(term_count)
-        except (TypeError, ValueError):
-            term_count_int = 0
-
-        per_interest = amount_capital * rate / 100.0
-        total_interest = per_interest * term_count_int
-        total_to_pay = amount_capital + total_interest
-
-        # Suma de TODOS los pagos registrados del préstamo
-        cur.execute("SELECT COALESCE(SUM(amount),0) AS s FROM payments WHERE loan_id=%s", (loan_id,))
-        total_pagado = float(cur.fetchone()["s"] or 0)
-
-        new_status = loan["status"] or "activo"
-        if total_to_pay > 0:
-            if total_pagado >= total_to_pay - 0.01:  # margen pequeño por redondeo
-                new_status = "cerrado"
-        else:
-            # Si no hay intereses definidos usamos remaining para cerrar
-            if current_remaining <= 0:
-                new_status = "cerrado"
-
-        cur.execute("""
-            UPDATE loans
-            SET status = %s
-            WHERE id = %s
-        """, (new_status, loan_id))
+        if total_paid >= total_to_pay - 0.01:
+            cur.execute("UPDATE loans SET status='cerrado' WHERE id=%s", (loan_id,))
 
         conn.commit()
         cur.close()
         conn.close()
 
-        flash("Pago registrado correctamente.", "success")
+        flash("Pago registrado.", "success")
         return redirect(url_for("loan_detail", loan_id=loan_id))
 
-    # GET → formulario
     body = f"""
-    <div class="card">
-      <h2>Registrar pago - Préstamo #{loan_id}</h2>
-      <p>Cliente: {loan['first_name']} {loan['last_name']}</p>
-      <p>Monto capital: {fmt_money(loan['amount'])}</p>
-      <p>Monto restante de capital: {fmt_money(loan['remaining'])}</p>
+    <div class='card'>
+        <h2>Registrar pago — Préstamo #{loan_id}</h2>
 
-      <form method="post">
-        <label>Monto ({CURRENCY})</label>
-        <input type="number" step="0.01" name="amount" required>
+        <form method='post'>
+            <label>Monto</label>
+            <input type='number' name='amount' step='0.01' required>
 
-        <label>Tipo de pago</label>
-        <select name="type" required>
-          <option value="cuota">Cuota (capital + interés)</option>
-          <option value="capital">Solo capital</option>
-          <option value="interes">Solo interés</option>
-        </select>
+            <label>Tipo</label>
+            <select name='type'>
+                <option value='cuota'>Cuota</option>
+                <option value='capital'>Capital</option>
+                <option value='interes'>Interés</option>
+            </select>
 
-        <label>Fecha</label>
-        <input type="date" name="date" value="{date.today()}" required>
+            <label>Fecha</label>
+            <input type='date' name='date' value='{date.today()}' required>
 
-        <label>Nota (opcional)</label>
-        <input name="note">
+            <label>Nota</label>
+            <input name='note'>
 
-        <button class="btn btn-primary" style="margin-top:10px;">Guardar pago</button>
-      </form>
+            <button class='btn btn-primary' style='margin-top:12px;'>Guardar</button>
+        </form>
     </div>
     """
 
-    cur.close()
-    conn.close()
-
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        admin_whatsapp=ADMIN_WHATSAPP,
+        TPL_LAYOUT, body=body, user=user,
         app_brand=APP_BRAND,
         flashes=get_flashed_messages(with_categories=True),
         theme=get_theme()
@@ -1892,117 +1182,108 @@ def new_payment(loan_id):
 
 
 # ============================================================
-#  GASTOS DE RUTA / EFECTIVO ENTREGADO
+# GASTOS DE RUTA
 # ============================================================
 
 @app.route("/route-expenses", methods=["GET", "POST"])
 @login_required
 def route_expenses():
     user = current_user()
+
     conn = get_conn()
     cur = conn.cursor()
 
     if request.method == "POST":
-        amount = request.form.get("amount", type=float)
-        note = request.form.get("note", "")
+        amount = float(request.form.get("amount"))
+        note = request.form.get("note")
         date_str = request.form.get("date")
 
-        if not amount or amount <= 0:
-            flash("Monto inválido.", "danger")
-        else:
-            try:
-                d = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except (TypeError, ValueError):
-                d = date.today()
-            cur.execute("""
-                INSERT INTO cash_reports (user_id, date, amount, note)
-                VALUES (%s,%s,%s,%s)
-            """, (user["id"], d, amount, note))
-            conn.commit()
-            flash("Efectivo entregado registrado.", "success")
+        d = datetime.strptime(date_str, "%Y-%m-%d").date()
+
+        cur.execute("""
+            INSERT INTO cash_reports (user_id, date, amount, note)
+            VALUES (%s,%s,%s,%s)
+        """, (user["id"], d, amount, note))
+
+        conn.commit()
+        flash("Registro guardado.", "success")
 
     # Listado
-    if user["role"] == "admin":
+    if user["rol"] == "admin":
         cur.execute("""
             SELECT c.id, c.date, c.amount, c.note, u.username
             FROM cash_reports c
-            LEFT JOIN users u ON u.id = c.user_id
+            LEFT JOIN users u ON u.id=c.user_id
             ORDER BY c.date DESC, c.id DESC
-            LIMIT 200;
+            LIMIT 200
         """)
     else:
         cur.execute("""
             SELECT c.id, c.date, c.amount, c.note, u.username
             FROM cash_reports c
-            LEFT JOIN users u ON u.id = c.user_id
-            WHERE c.user_id = %s
+            LEFT JOIN users u ON u.id=c.user_id
+            WHERE c.user_id=%s
             ORDER BY c.date DESC, c.id DESC
-            LIMIT 200;
+            LIMIT 200
         """, (user["id"],))
-    rows = cur.fetchall()
 
+    rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    rows_html = "".join([
+    list_html = "".join([
         f"""
         <tr>
-          <td>{r['id']}</td>
-          <td>{r['date']}</td>
-          <td>{fmt_money(r['amount'])}</td>
-          <td>{r.get('username') or ''}</td>
-          <td>{r.get('note') or ''}</td>
+            <td>{r['id']}</td>
+            <td>{r['date']}</td>
+            <td>{fmt_money(r['amount'])}</td>
+            <td>{r.get('username','')}</td>
+            <td>{r['note'] or ''}</td>
         </tr>
-        """
-        for r in rows
+        """ for r in rows
     ])
 
     body = f"""
-    <div class="card">
-      <h2>Gastos de ruta / Efectivo entregado</h2>
-      <p>Registre cuánto dinero en efectivo entrega cada trabajador al finalizar su ruta.</p>
+    <div class='card'>
+        <h2>Gastos de ruta</h2>
 
-      <form method="post">
-        <label>Fecha</label>
-        <input type="date" name="date" value="{date.today()}">
+        <form method='post'>
+            <label>Fecha</label>
+            <input type='date' name='date' value='{date.today()}' required>
 
-        <label>Monto entregado ({CURRENCY})</label>
-        <input type="number" step="0.01" name="amount" required>
+            <label>Monto</label>
+            <input type='number' step='0.01' name='amount' required>
 
-        <label>Nota (opcional)</label>
-        <input name="note">
+            <label>Nota</label>
+            <input name='note'>
 
-        <button class="btn btn-primary" style="margin-top:10px;">Guardar</button>
-      </form>
+            <button class='btn btn-primary' style='margin-top:12px;'>Guardar</button>
+        </form>
     </div>
 
-    <div class="card">
-      <h3>Historial de efectivo entregado</h3>
-      <div class="table-wrapper">
+    <div class='card'>
+        <h3>Historial</h3>
         <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Fecha</th><th>Monto</th><th>Usuario</th><th>Nota</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Fecha</th><th>Monto</th>
+                    <th>Usuario</th><th>Nota</th>
+                </tr>
+            </thead>
+            <tbody>{list_html}</tbody>
         </table>
-      </div>
     </div>
     """
+
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
+        TPL_LAYOUT, body=body, user=user,
         flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
+        app_brand=APP_BRAND, theme=get_theme()
     )
 
 
 # ============================================================
-#  AUDITORÍA
+# AUDITORÍA
 # ============================================================
 
 @app.route("/audit")
@@ -2011,105 +1292,190 @@ def route_expenses():
 def audit():
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         SELECT a.id, a.created_at, a.action, a.detail, u.username
         FROM audit_log a
-        LEFT JOIN users u ON u.id = a.user_id
+        LEFT JOIN users u ON u.id=a.user_id
         ORDER BY a.id DESC
-        LIMIT 200;
+        LIMIT 200
     """)
+
     rows = cur.fetchall()
     cur.close()
     conn.close()
 
-    rows_html = "".join([
+    html = "".join([
         f"""
         <tr>
-          <td>{r['id']}</td>
-          <td>{r['created_at']}</td>
-          <td>{r['username'] or ''}</td>
-          <td>{r['action']}</td>
-          <td>{r['detail'] or ''}</td>
+            <td>{r['id']}</td>
+            <td>{r['created_at']}</td>
+            <td>{r.get('username','')}</td>
+            <td>{r['action']}</td>
+            <td>{r['detail']}</td>
         </tr>
-        """
-        for r in rows
+        """ for r in rows
     ])
 
     body = f"""
-    <div class="card">
-      <h2>Auditoría</h2>
-      <div class="table-wrapper">
+    <div class='card'>
+        <h2>Auditoría</h2>
         <table>
-          <thead>
-            <tr>
-              <th>ID</th><th>Fecha</th><th>Usuario</th>
-              <th>Acción</th><th>Detalle</th>
-            </tr>
-          </thead>
-          <tbody>{rows_html}</tbody>
+            <thead>
+                <tr>
+                    <th>ID</th><th>Fecha</th><th>Usuario</th>
+                    <th>Acción</th><th>Detalle</th>
+                </tr>
+            </thead>
+            <tbody>{html}</tbody>
         </table>
-      </div>
     </div>
     """
 
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=current_user(),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
+        TPL_LAYOUT, body=body, user=current_user(),
         flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
+        app_brand=APP_BRAND, theme=get_theme()
     )
 
 
 # ============================================================
-#  LOGOUT Y RECUPERAR PASSWORD
+# RECUPERAR CONTRASEÑA
 # ============================================================
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    flash("Sesión cerrada.", "success")
-    return redirect(url_for("login"))
-
 
 @app.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
     if request.method == "POST":
-        flash("Contacte al admin para recuperar su contraseña.", "info")
+        flash("Contacte al administrador para recuperar su contraseña.", "info")
         return redirect(url_for("login"))
 
     body = """
-    <div class="card">
-      <h2>Recuperar contraseña</h2>
-      <p>Por seguridad, la recuperación se realiza por el administrador.</p>
-      <p>Escríbele por WhatsApp al número mostrado en la parte superior (SOS).</p>
-      <form method="post">
-        <button class="btn btn-primary">Entendido</button>
-      </form>
+    <div class='card'>
+        <h2>Recuperar contraseña</h2>
+        <p>Por seguridad, solo el administrador puede cambiar contraseñas.</p>
+        <form method='post'>
+            <button class='btn btn-primary'>Entendido</button>
+        </form>
     </div>
     """
 
     return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=current_user(),
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
+        TPL_LAYOUT, body=body, user=current_user(),
         flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
+        app_brand=APP_BRAND, theme=get_theme()
     )
 
 
 # ============================================================
-# FINAL – EJECUCIÓN
+# BASE DE DATOS — INIT_DB
 # ============================================================
 
-# Inicializar BD al arrancar
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+
+    try:
+        # USERS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                rol VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        # CLIENTS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clients (
+                id SERIAL PRIMARY KEY,
+                first_name VARCHAR(100) NOT NULL,
+                last_name VARCHAR(100),
+                phone VARCHAR(50),
+                address VARCHAR(200),
+                document_id VARCHAR(100),
+                route VARCHAR(100),
+                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        # LOANS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS loans (
+                id SERIAL PRIMARY KEY,
+                client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+                amount NUMERIC(12,2) NOT NULL,
+                rate NUMERIC(5,2) NOT NULL,
+                frequency VARCHAR(20) NOT NULL,
+                start_date DATE NOT NULL,
+                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                remaining NUMERIC(12,2),
+                total_interest_paid NUMERIC(12,2) DEFAULT 0,
+                status VARCHAR(20) DEFAULT 'activo',
+                term_count INTEGER,
+                end_date DATE,
+                fee_percent NUMERIC(5,2) DEFAULT 10,
+                fee_amount NUMERIC(12,2) DEFAULT 0,
+                disbursement NUMERIC(12,2) DEFAULT 0,
+                auto_end_date DATE
+            );
+        """)
+
+        # PAYMENTS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                loan_id INTEGER REFERENCES loans(id) ON DELETE CASCADE,
+                amount NUMERIC(12,2) NOT NULL,
+                type VARCHAR(20) NOT NULL,
+                note TEXT,
+                date DATE,
+                created_by INTEGER REFERENCES users(id),
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        # GASTOS
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cash_reports (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                date DATE NOT NULL,
+                amount NUMERIC(12,2) NOT NULL,
+                note TEXT
+            );
+        """)
+
+        # AUDITORÍA
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                action TEXT,
+                detail TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            );
+        """)
+
+        conn.commit()
+
+    except Exception as e:
+        conn.rollback()
+        print("❌ Error init_db:", e)
+
+    finally:
+        cur.close()
+        conn.close()
+
+
+# ============================================================
+# EJECUCIÓN FINAL
+# ============================================================
+
 init_db()
 
 if __name__ == "__main__":
-    print("[JDM Cash Now] Iniciando servidor…")
+    print("[JDM Cash Now Pro] Servidor iniciado.")
     app.run(host="0.0.0.0", port=5000, debug=True)
-
