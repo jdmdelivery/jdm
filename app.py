@@ -1338,6 +1338,15 @@ def audit():
         app_brand=APP_BRAND, theme=get_theme()
     )
 
+# ============================================================
+# LOGOUT
+# ============================================================
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Sesión cerrada.", "success")
+    return redirect(url_for("login"))
 
 # ============================================================
 # RECUPERAR CONTRASEÑA
@@ -1479,3 +1488,4 @@ init_db()
 if __name__ == "__main__":
     print("[JDM Cash Now Pro] Servidor iniciado.")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
