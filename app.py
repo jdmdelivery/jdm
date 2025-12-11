@@ -1598,105 +1598,6 @@ def new_loan():
     flash("✅ Préstamo creado correctamente", "success")
     return redirect(url_for("loan_detail", loan_id=loan_id))
 
-
-    options = "".join([
-        f"<option value='{c['id']}' {'selected' if pre_client_id and pre_client_id == c['id'] else ''}>{c['first_name']} {c['last_name']}</option>"
-        for c in clients
-    ])
-
-    cur.close()
-    conn.close()
-
-    body = f"""
-    <div class="card">
-      <h2>Nuevo préstamo</h2>
-
-    body = f"""
-<div class="card">
-    <h2>Nuevo préstamo</h2>
-
-    <form method="post" id="loan-form">
-
-        <label>Cliente</label>
-        <select name="client_id" required>
-            <option value="">--Seleccione--</option>
-            {options}
-        </select>
-
-        <label>Monto ({CURRENCY})</label>
-        <input type="number" step="0.01" name="amount" required>
-
-        <label>Interés %</label>
-        <input type="number" step="0.01" name="rate" value="0">
-
-        <label>Fee (%)</label>
-        <input type="number" step="0.01" name="fee_percent" value="10" required>
-        <small style="color:#555;">
-            (El cobrador no puede poner 0%. Solo el admin puede dejarlo en 0.)
-        </small>
-
-        <div id="fee-info" style="margin-top: 10px; color: #047857; font-size: 0.9rem;">
-            <!-- Aquí se mostrará el fee y el desembolso en vivo -->
-        </div>
-
-        <label>Frecuencia</label>
-        <select name="frequency" required>
-            <option value="diario">Diario</option>
-            <option value="semanal">Semanal</option>
-            <option value="quincenal">Quincenal</option>
-            <option value="mensual">Mensual</option>
-        </select>
-
-        <label>Fecha de inicio (desde)</label>
-        <input type="date" name="start_date" value="{date.today()}">
-
-        <label>Número de períodos</label>
-        <div style="display:flex; gap:8px; max-width:320px; align-items:center;">
-            <input type="number" name="term_count" required value="10">
-            <select name="term_kind" id="term-kind">
-                <option value="semanas" selected>Semanas</option>
-                <option value="dias">Días</option>
-            </select>
-        </div>
-
-        <button type="submit" class="btn-primary">Guardar</button>
-    </form>
-</div>
-
-<script>
-const amountInput = document.querySelector("input[name='amount']");
-const feeInput = document.querySelector("input[name='fee_percent']");
-const infoDiv = document.getElementById("fee-info");
-
-function updateFee() {
-    const amount = parseFloat(amountInput.value) || 0;
-    const fee = parseFloat(feeInput.value) || 0;
-
-    const feeAmount = (amount * fee) / 100;
-    const disbursed = amount - feeAmount;
-
-    infoDiv.innerHTML = `
-        Fee: <b>${feeAmount.toFixed(2)} {CURRENCY}</b><br>
-        Desembolso al cliente: <b>${disbursed.toFixed(2)} {CURRENCY}</b>
-    `;
-}
-
-amountInput.addEventListener("input", updateFee);
-feeInput.addEventListener("input", updateFee);
-</script>
-"""
-
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        app_brand=APP_BRAND,
-        admin_whatsapp=ADMIN_WHATSAPP,
-        flashes=get_flashed_messages(with_categories=True),
-        theme=get_theme()
-    )
-
-
 # ============================================================
 #  DETALLE DE PRÉSTAMO + PAGOS
 # ============================================================
@@ -2211,3 +2112,4 @@ init_db()
 if __name__ == "__main__":
     print("[JDM Cash Now] Iniciando servidor…")
     app.run(host="0.0.0.0", port=5000, debug=True)
+
