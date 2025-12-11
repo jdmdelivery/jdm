@@ -15,54 +15,42 @@
 #   - Enviar factura al cliente por WhatsApp / SMS
 # ============================================================
 
-from __future__ import annotations
+# ============================================================
+#  BLOQUE 1 — CONFIGURACIÓN PRINCIPAL + BASE DE DATOS
+# ============================================================
 
+from __future__ import annotations
 from flask import (
     Flask, request, redirect, url_for, Response,
     render_template_string, session, flash, get_flashed_messages
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
-
 import psycopg2
 import psycopg2.extras
-
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
+from dateutil.relativedelta import relativedelta
 import os
 import secrets
 from urllib.parse import quote_plus
 
-# =============================
-# CONFIGURACIÓN PRINCIPAL
-# =============================
+# ============================================================
+#   CONFIGURACIÓN DEL SISTEMA
+# ============================================================
 
-APP_BRAND = "JDM Cash Now"
-
-# PIN para borrar / cambiar contraseñas
+APP_BRAND = "JDM Cash Now Pro"
+CURRENCY = "RD$"
 ADMIN_PIN = os.getenv("ADMIN_PIN", "5555")
-
-# Roles disponibles
+ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
 ROLES = ("admin", "supervisor", "cobrador")
 
-# MONEDA
-CURRENCY = "RD$"
+# ============================================================
+#   CONEXIÓN A LA BASE DE DATOS POSTGRES
+# ============================================================
 
-# WhatsApp SOS / recuperación
-ADMIN_WHATSAPP = os.getenv("ADMIN_WHATSAPP", "3128565688")
-
-# URL de la base de datos (Render)
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("❌ ERROR: Falta la DATABASE_URL en Render → Environment.")
-
-# Crear app Flask
-app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(16))
-
-
-# =============================
-# CONEXIÓN A BASE DE DATOS
-# =============================
+    raise Exception("❌ ERROR: No está configurada la variable DATABASE_URL en Render.")
 
 def get_conn():
     return psycopg2.connect(
@@ -71,27 +59,20 @@ def get_conn():
         cursor_factory=psycopg2.extras.RealDictCursor
     )
 
+# ============================================================
+#   CREACIÓN DE LA APLICACIÓN FLASK
+# ============================================================
 
-# =============================
-# FORMATEO DE DINERO
-# =============================
+app = Flask(__name__)
+app.secret_key = os.getenv("SECRET_KEY", secrets.token_hex(32))
 
-def fmt_money(val):
-    try:
-        v = float(val or 0)
-    except (TypeError, ValueError):
-        v = 0.0
-    return f"{CURRENCY} {v:.2f}"
+# ============================================================
+#   CREACIÓN / RESET DE TABLAS
+# ============================================================
 
-
-def get_theme():
-    """Devuelve 'light' o 'dark' según lo guardado en sesión."""
-    return session.get("theme", "light")
-
-
-# =============================
+# ============================================================
 # CREACIÓN / RESET DE TABLAS
-# =============================
+# ============================================================
 
 def init_db():
     conn = get_conn()
@@ -103,8 +84,8 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 username VARCHAR(100) UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
-                role VARCHAR(20) NOT NULL,
-                created_at TIMESTAMP NOT NULL
+                rol VARCHAR(20) NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
 
@@ -115,8 +96,8 @@ def init_db():
                 first_name VARCHAR(100) NOT NULL,
                 last_name VARCHAR(100),
                 phone VARCHAR(50),
-                address TEXT,
-                document_id VARCHAR(100),
+                address VARCHAR(200),
+                document VARCHAR(100),
                 route VARCHAR(100),
                 created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
@@ -134,8 +115,8 @@ def init_db():
                 start_date DATE NOT NULL,
                 created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
                 remaining NUMERIC(12,2),
-                total_interest_paid NUMERIC(12,2),
-                status VARCHAR(20),
+                total_interest_paid NUMERIC(12,2) DEFAULT 0,
+                status VARCHAR(20) DEFAULT 'activo',
                 term_count INTEGER,
                 end_date DATE
             );
@@ -147,97 +128,33 @@ def init_db():
                 id SERIAL PRIMARY KEY,
                 loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
                 amount NUMERIC(12,2) NOT NULL,
-                type VARCHAR(20),
-                note TEXT,
-                date DATE NOT NULL,
-                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL
-            );
-        """)
-
-        # ---- Tabla auditoría ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS audit_log (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                action VARCHAR(255) NOT NULL,
-                detail TEXT,
+                type VARCHAR(20) NOT NULL,   -- interes / capital / cuota
+                created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
                 created_at TIMESTAMP NOT NULL DEFAULT NOW()
             );
         """)
 
-        # ---- Tabla efectivo entregado (Gastos de ruta) ----
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS cash_reports (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
-                date DATE NOT NULL,
-                amount NUMERIC(12,2) NOT NULL,
-                note TEXT,
-                created_at TIMESTAMP NOT NULL DEFAULT NOW()
-            );
-        """)
+        # ========================
+        # AGREGAR NUEVAS COLUMNAS
+        # ========================
 
-        # ✅ Asegurar columnas nuevas en loans (para BD viejas)
-        cur.execute("""
-            ALTER TABLE loans
-            ADD COLUMN IF NOT EXISTS remaining NUMERIC(12,2);
-        """)
-        cur.execute("""
-            ALTER TABLE loans
-            ADD COLUMN IF NOT EXISTS total_interest_paid NUMERIC(12,2) DEFAULT 0;
-        """)
-        cur.execute("""
-            ALTER TABLE loans
-            ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'activo';
-        """)
-        cur.execute("""
-            ALTER TABLE loans
-            ADD COLUMN IF NOT EXISTS term_count INTEGER;
-        """)
-        cur.execute("""
-            ALTER TABLE loans
-            ADD COLUMN IF NOT EXISTS end_date DATE;
-        """)
+        # Asegurar columnas nuevas
+        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS fee_percent NUMERIC(5,2) DEFAULT 10;""")
+        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(12,2) DEFAULT 0;""")
+        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS disbursement NUMERIC(12,2) DEFAULT 0;""")
+        cur.execute("""ALTER TABLE loans ADD COLUMN IF NOT EXISTS auto_end_date DATE;""")
 
-        # ✅ Asegurar columna ruta en clientes
-        cur.execute("""
-            ALTER TABLE clients
-            ADD COLUMN IF NOT EXISTS route VARCHAR(100);
-        """)
+        # Asegurar route en clientes
+        cur.execute("""ALTER TABLE clients ADD COLUMN IF NOT EXISTS route VARCHAR(100);""")
 
-        # ✅ Inicializar valores nulos si la tabla ya existía
-        cur.execute("""
-            UPDATE loans
-            SET remaining = amount
-            WHERE remaining IS NULL;
-        """)
-        cur.execute("""
-            UPDATE loans
-            SET total_interest_paid = 0
-            WHERE total_interest_paid IS NULL;
-        """)
-        cur.execute("""
-            UPDATE loans
-            SET status = 'activo'
-            WHERE status IS NULL OR status = '';
-        """)
-
-        # Crear admin si no existe
-        cur.execute("SELECT COUNT(*) AS c FROM users;")
-        if cur.fetchone()["c"] == 0:
-            cur.execute("""
-                INSERT INTO users (username, password_hash, role, created_at)
-                VALUES (%s, %s, %s, %s)
-            """, (
-                "admin",
-                generate_password_hash("admin"),
-                "admin",
-                datetime.utcnow(),
-            ))
-            print("✔ Usuario admin creado (user=admin, pass=admin)")
+        # Inicializar valores nulos
+        cur.execute("""UPDATE loans SET remaining = amount WHERE remaining IS NULL;""")
+        cur.execute("""UPDATE loans SET total_interest_paid = 0 WHERE total_interest_paid IS NULL;""")
 
         conn.commit()
-        print("✔ Base de datos inicializada correctamente")
+    except Exception as e:
+        conn.rollback()
+        print("❌ Error en init_db:", e)
     finally:
         cur.close()
         conn.close()
@@ -1617,85 +1534,70 @@ def loans():
     )
 
 
-@app.route("/loans/new", methods=["GET", "POST"])
-@login_required
+@app.route("/new-loan", methods=["POST"])
 def new_loan():
-    user = current_user()
+    if "user" not in session:
+        return redirect(url_for("login"))
+
+    user = session["user"]
+
+    client_id = request.form.get("client_id")
+    amount = float(request.form.get("amount"))
+    rate = float(request.form.get("rate") or 0)
+    freq = request.form.get("frequency")
+    start_date = request.form.get("start_date")
+    term_count = int(request.form.get("term_count"))
+    term_kind = request.form.get("term_kind")
+    fee_percent = float(request.form.get("fee_percent"))
+
+    # === Validación del fee ===
+    if user["rol"] != "admin" and fee_percent <= 0:
+        flash("❌ Solo el admin puede poner fee 0%.", "error")
+        return redirect(url_for("new_loan_form"))
+
+    # === Cálculo del fee y desembolso ===
+    fee_amount = (amount * fee_percent) / 100
+    disbursement = amount - fee_amount
+
+    # === Calcular fecha final automática ===
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+
+    if term_kind == "dias":
+        auto_end_date = start + timedelta(days=term_count)
+    else:  # semanas
+        auto_end_date = start + timedelta(weeks=term_count)
+
+    # === Insertar préstamo ===
     conn = get_conn()
     cur = conn.cursor()
 
-    # Si viene client_id por querystring, lo usamos para preseleccionar
-    pre_client_id = request.args.get("client_id", type=int)
+    cur.execute("""
+        INSERT INTO loans (
+            client_id, amount, rate, frequency,
+            start_date, created_by, remaining,
+            total_interest_paid, status, term_count,
+            end_date, fee_percent, fee_amount,
+            disbursement, auto_end_date
+        )
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        RETURNING id;
+    """, (
+        client_id, amount, rate, freq,
+        start_date, user["id"], amount,
+        0, "activo", term_count,
+        auto_end_date, fee_percent,
+        fee_amount, disbursement,
+        auto_end_date
+    ))
 
-    if user["role"] == "cobrador":
-        cur.execute("""
-            SELECT id, first_name, last_name
-            FROM clients
-            WHERE created_by = %s
-            ORDER BY first_name, last_name
-        """, (user["id"],))
-    else:
-        cur.execute("""
-            SELECT id, first_name, last_name
-            FROM clients
-            ORDER BY first_name, last_name
-        """)
-    clients = cur.fetchall()
+    loan_id = cur.fetchone()["id"]
+    conn.commit()
+    cur.close()
+    conn.close()
 
-    if request.method == "POST":
-        client_id = request.form.get("client_id", type=int)
-        amount = request.form.get("amount", type=float)
-        rate = request.form.get("rate", type=float)
-        freq = request.form.get("frequency")
-        start_str = request.form.get("start_date")
-        term_count = request.form.get("term_count", type=int)
-        end_str = request.form.get("end_date")
+    flash("✅ Préstamo creado correctamente", "success")
+    return redirect(url_for("loan_detail", loan_id=loan_id))
 
-        if not client_id or not amount or not freq or not start_str:
-            flash("Complete todos los campos obligatorios.", "danger")
-            cur.close()
-            conn.close()
-            return redirect(url_for("new_loan"))
-
-        try:
-            start_date = datetime.strptime(start_str, "%Y-%m-%d").date()
-        except ValueError:
-            start_date = date.today()
-
-        end_date = None
-        if end_str:
-            try:
-                end_date = datetime.strptime(end_str, "%Y-%m-%d").date()
-            except ValueError:
-                end_date = None
-
-        cur.execute("""
-            INSERT INTO loans
-            (client_id, amount, rate, frequency, start_date,
-             created_by, remaining, total_interest_paid, status,
-             term_count, end_date)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-            RETURNING id;
-        """, (
-            client_id,
-            amount,
-            rate or 0,
-            freq,
-            start_date,
-            user["id"],
-            amount,
-            0,
-            "activo",
-            term_count,
-            end_date
-        ))
-        new_id = cur.fetchone()["id"]
-        conn.commit()
-        cur.close()
-        conn.close()
-
-        flash("Préstamo creado correctamente.", "success")
-        return redirect(url_for("loan_detail", loan_id=new_id))
 
     options = "".join([
         f"<option value='{c['id']}' {'selected' if pre_client_id and pre_client_id == c['id'] else ''}>{c['first_name']} {c['last_name']}</option>"
@@ -1709,11 +1611,16 @@ def new_loan():
     <div class="card">
       <h2>Nuevo préstamo</h2>
 
-      <form method="post" id="loan-form">
+    body = f"""
+<div class="card">
+    <h2>Nuevo préstamo</h2>
+
+    <form method="post" id="loan-form">
+
         <label>Cliente</label>
         <select name="client_id" required>
-          <option value="">--Seleccione--</option>
-          {options}
+            <option value="">--Seleccione--</option>
+            {options}
         </select>
 
         <label>Monto ({CURRENCY})</label>
@@ -1722,12 +1629,22 @@ def new_loan():
         <label>Interés %</label>
         <input type="number" step="0.01" name="rate" value="0">
 
+        <label>Fee (%)</label>
+        <input type="number" step="0.01" name="fee_percent" value="10" required>
+        <small style="color:#555;">
+            (El cobrador no puede poner 0%. Solo el admin puede dejarlo en 0.)
+        </small>
+
+        <div id="fee-info" style="margin-top: 10px; color: #047857; font-size: 0.9rem;">
+            <!-- Aquí se mostrará el fee y el desembolso en vivo -->
+        </div>
+
         <label>Frecuencia</label>
         <select name="frequency" required>
-          <option value="diario">Diario</option>
-          <option value="semanal">Semanal</option>
-          <option value="quincenal">Quincenal</option>
-          <option value="mensual">Mensual</option>
+            <option value="diario">Diario</option>
+            <option value="semanal">Semanal</option>
+            <option value="quincenal">Quincenal</option>
+            <option value="mensual">Mensual</option>
         </select>
 
         <label>Fecha de inicio (desde)</label>
@@ -1735,61 +1652,39 @@ def new_loan():
 
         <label>Número de períodos</label>
         <div style="display:flex; gap:8px; max-width:320px; align-items:center;">
-          <select name="term_kind" id="term-kind">
-            <option value="semanas" selected>Semanas</option>
-            <option value="dias">Días</option>
-            <option value="quincenas">Quincenas</option>
-            <option value="meses">Meses</option>
-          </select>
-          <input type="number" name="term_count" min="1" value="1" style="flex:1;">
+            <input type="number" name="term_count" required value="10">
+            <select name="term_kind" id="term-kind">
+                <option value="semanas" selected>Semanas</option>
+                <option value="dias">Días</option>
+            </select>
         </div>
-        <small id="term-help" style="font-size:0.8rem;color:#4b5563;">
-          Ejemplo: 10 semanas, 5 quincenas, 3 meses, etc.
-        </small>
 
-        <label>Fecha final (hasta)</label>
-        <input type="date" name="end_date">
+        <button type="submit" class="btn-primary">Guardar</button>
+    </form>
+</div>
 
-        <div id="loan-summary" style="margin-top:10px;font-size:0.9rem;"></div>
+<script>
+const amountInput = document.querySelector("input[name='amount']");
+const feeInput = document.querySelector("input[name='fee_percent']");
+const infoDiv = document.getElementById("fee-info");
 
-        <button class="btn btn-primary" style="margin-top:10px;">Guardar</button>
-      </form>
-    </div>
+function updateFee() {
+    const amount = parseFloat(amountInput.value) || 0;
+    const fee = parseFloat(feeInput.value) || 0;
 
-    <script>
-    (function() {{
-      function recalc() {{
-        var amount = parseFloat(document.querySelector('input[name="amount"]').value) || 0;
-        var rate = parseFloat(document.querySelector('input[name="rate"]').value) || 0;
-        var n = parseInt(document.querySelector('input[name="term_count"]').value) || 0;
-        var perInterest = amount * rate / 100.0;
-        var totalInterest = perInterest * n;
-        var total = amount + totalInterest;
+    const feeAmount = (amount * fee) / 100;
+    const disbursed = amount - feeAmount;
 
-        var kindSel = document.getElementById('term-kind');
-        var kindText = kindSel ? kindSel.options[kindSel.selectedIndex].text : "períodos";
-        var pagoLabel = kindText.toLowerCase();
-        var cuota = n > 0 ? (total / n) : 0;
+    infoDiv.innerHTML = `
+        Fee: <b>${feeAmount.toFixed(2)} {CURRENCY}</b><br>
+        Desembolso al cliente: <b>${disbursed.toFixed(2)} {CURRENCY}</b>
+    `;
+}
 
-        var box = document.getElementById('loan-summary');
-        if (!box) return;
-        box.innerHTML =
-          "Interés por período: {CURRENCY} " + perInterest.toFixed(2) +
-          " · Interés total: {CURRENCY} " + totalInterest.toFixed(2) +
-          " · Total a pagar (capital + interés): {CURRENCY} " + total.toFixed(2) +
-          " · Pago por " + pagoLabel.slice(0, -1) + ": {CURRENCY} " + cuota.toFixed(2) +
-          " · Plazo: " + n + " " + kindText;
-      }}
-      ['amount','rate','term_count'].forEach(function(name) {{
-        var el = document.querySelector('[name=\"' + name + '\"]');
-        if (el) el.addEventListener('input', recalc);
-      }});
-      var kindSelect = document.getElementById('term-kind');
-      if (kindSelect) kindSelect.addEventListener('change', recalc);
-      recalc();
-    }})();
-    </script>
-    """
+amountInput.addEventListener("input", updateFee);
+feeInput.addEventListener("input", updateFee);
+</script>
+"""
 
     return render_template_string(
         TPL_LAYOUT,
@@ -1805,6 +1700,7 @@ def new_loan():
 # ============================================================
 #  DETALLE DE PRÉSTAMO + PAGOS
 # ============================================================
+
 
 @app.route("/loan/<int:loan_id>")
 @login_required
@@ -1846,210 +1742,93 @@ def loan_detail(loan_id):
     payments = cur.fetchall()
 
     # ===== Cálculo de cuotas y totales =====
-    term_count = loan.get("term_count") or 0
-    try:
-        term_count_int = int(term_count)
-    except (TypeError, ValueError):
-        term_count_int = 0
-
+    term_count = int(loan.get("term_count") or 0)
     amount = float(loan["amount"] or 0)
     rate = float(loan["rate"] or 0)
 
     per_interest = amount * rate / 100.0
-    total_interest = per_interest * term_count_int
+    total_interest = per_interest * term_count
     total_to_pay = amount + total_interest
-    installment = total_to_pay / term_count_int if term_count_int > 0 else 0.0
+    installment = total_to_pay / term_count if term_count > 0 else 0.0
 
-    # Pagos realizados (cualquier tipo) para calcular restante total
-    total_pagado = 0.0
-    for p in payments:
-        try:
-            total_pagado += float(p["amount"] or 0)
-        except (TypeError, ValueError):
-            pass
-
-    cuotas_pagadas = int(installment > 0 and total_pagado // installment) if installment > 0 else 0
-    if cuotas_pagadas > term_count_int:
-        cuotas_pagadas = term_count_int
-
+    total_pagado = sum(float(p.get("amount") or 0) for p in payments)
+    cuotas_pagadas = min(int(total_pagado // installment if installment else 0), term_count)
     restante_total = max(0.0, total_to_pay - total_pagado)
 
-    # Palabra para períodos según frecuencia
-    freq_label_word = "períodos"
-    if loan["frequency"] == "diario":
-        freq_label_word = "días"
-    elif loan["frequency"] == "semanal":
-        freq_label_word = "semanas"
-    elif loan["frequency"] == "quincenal":
-        freq_label_word = "quincenas"
-    elif loan["frequency"] == "mensual":
-        freq_label_word = "meses"
+    # ===== Cálculo de fecha final =====
+    start_date = loan.get("start_date")
+    freq = loan.get("frequency")
 
-    if freq_label_word.endswith("s"):
-        pago_label = freq_label_word[:-1]
-    else:
-        pago_label = "período"
-
-    if term_count_int > 0:
-        cuotas_resumen = f"{cuotas_pagadas}/{term_count_int}"
-    else:
-        cuotas_resumen = "N/A"
-
-    # ===== Cálculo aproximado de atraso según frecuencia / interés =====
-    today = date.today()
-    start_date = loan["start_date"]
-    freq = loan["frequency"]
-
-    step_days = 7
+    days_per = 7
     if freq == "diario":
-        step_days = 1
-    elif freq == "semanal":
-        step_days = 7
+        days_per = 1
     elif freq == "quincenal":
-        step_days = 14
+        days_per = 14
     elif freq == "mensual":
-        step_days = 30
+        days_per = 30
 
-    overdue_html = ""
-    if isinstance(start_date, date) and rate > 0:
-        elapsed_days = max(0, (today - start_date).days)
-        expected_periods = elapsed_days // step_days
-        if term_count_int:
-            expected_periods = min(expected_periods, term_count_int)
+    if isinstance(start_date, date):
+        end_date = start_date + timedelta(days=days_per * term_count)
+        end_date_str = end_date.strftime("%Y-%m-%d")
+    else:
+        end_date_str = "N/A"
 
-        per_interest_tmp = amount * rate / 100.0
-        paid_interest = float(loan.get("total_interest_paid") or 0)
-        paid_periods = int(paid_interest // per_interest_tmp) if per_interest_tmp > 0 else 0
-        overdue_periods = max(0, expected_periods - paid_periods)
-
-        interest_due = per_interest_tmp * expected_periods
-        interest_pending = max(0.0, interest_due - paid_interest)
-
-        if overdue_periods > 0:
-            if freq in ("semanal", "quincenal"):
-                unit = "semana"
-            elif freq == "diario":
-                unit = "día"
-            else:
-                unit = "mes"
-            plural = "s" if overdue_periods != 1 else ""
-            overdue_html = f"""
-            <p style="color:#dc2626;font-weight:bold;">
-              ⚠ Tiene {overdue_periods} {unit}{plural} atrasada(s).
-            </p>
-            <p style="color:#b91c1c;">
-              Interés pendiente aproximado: {fmt_money(interest_pending)}.
-            </p>
-            """
-
-    # Botón de recibo si está cerrado (admin)
-    receipt_btn = ""
-    if (loan.get("status") or "").lower() == "cerrado":
-        msg = f"Recibo préstamo #{loan_id} pagado. Cliente: {loan['first_name']} {loan['last_name']}. Monto: {fmt_money(loan['amount'])}."
-        wa_url = f"https://wa.me/{ADMIN_WHATSAPP}?text={quote_plus(msg)}"
-        receipt_btn = f"""
-        <p>
-          <a class="btn btn-secondary" target="_blank" href="{wa_url}">
-            📲 Enviar recibo por WhatsApp al administrador
-          </a>
-        </p>
-        """
-
-    # Enviar factura al cliente por WhatsApp / SMS
+    # ===== Botón para WhatsApp factura =====
     client_phone = (loan.get("phone") or "").strip()
-    client_phone_digits = "".join(ch for ch in client_phone if ch.isdigit())
-    invoice_buttons = ""
-    inv_msg = (
-        f"Hola {loan['first_name']}, este es el detalle de su préstamo #{loan_id}: "
-        f"Capital {fmt_money(loan['amount'])}, interés total estimado {fmt_money(total_interest)}, "
-        f"total a pagar {fmt_money(total_to_pay)}, plazo {term_count_int} {freq_label_word}, "
-        f"pago por {pago_label} {fmt_money(installment)}. "
-        f"Restante aproximado: {fmt_money(restante_total)}."
+    wa_msg = (
+        f"Factura préstamo #{loan_id}%0A"
+        f"Cliente: {loan['first_name']} {loan['last_name']}%0A"
+        f"Monto: {fmt_money(amount)}%0A"
+        f"Interés: {rate}% %0A"
+        f"Total a pagar: {fmt_money(total_to_pay)}%0A"
+        f"Pago por período: {fmt_money(installment)}%0A"
+        f"Fecha final estimada: {end_date_str}"
     )
-    if client_phone_digits:
-        wa_client_url = f"https://wa.me/{client_phone_digits}?text={quote_plus(inv_msg)}"
-        invoice_buttons = f"""
-        <p>
-          <a class="btn btn-secondary" target="_blank" href="{wa_client_url}">
-            📲 Enviar factura al cliente por WhatsApp
-          </a>
-        </p>
-        <p style="font-size:0.9rem;">
-          Texto para SMS / nota:<br>
-          <textarea rows="3" style="width:100%;">{inv_msg}</textarea>
-        </p>
-        """
 
-    # Tabla de pagos
-    payments_html = "".join([
-        f"""
-        <tr>
-            <td>{p['id']}</td>
-            <td>{p['date']}</td>
-            <td>{fmt_money(p['amount'])}</td>
-            <td>{p['type']}</td>
-            <td>{p['note'] or ''}</td>
-        </tr>
-        """ for p in payments
-    ])
+    wa_url = ""
+    if client_phone:
+        wa_url = f"https://wa.me/{client_phone}?text={wa_msg}"
 
-    cur.close()
-    conn.close()
-
+    # ===== HTML =====
     body = f"""
     <div class="card">
-        <h2>Préstamo #{loan_id}</h2>
-        <p><strong>Cliente:</strong> {loan['first_name']} {loan['last_name']}</p>
-        <p><strong>Teléfono cliente:</strong> {loan.get('phone') or ''}</p>
+        <h2>Detalles del préstamo #{loan_id}</h2>
 
-        <p><strong>Monto capital:</strong> {fmt_money(loan['amount'])}</p>
-        <p><strong>Interés total estimado:</strong> {fmt_money(total_interest)}</p>
-        <p><strong>Total a pagar (capital + interés):</strong> {fmt_money(total_to_pay)}</p>
-        <p><strong>Plazo:</strong> {term_count_int} {freq_label_word}</p>
-        <p><strong>Pago por {pago_label}:</strong> {fmt_money(installment)}</p>
+        <p><b>Cliente:</b> {loan['first_name']} {loan['last_name']}</p>
+        <p><b>Monto prestado:</b> {fmt_money(amount)}</p>
+        <p><b>Interés %:</b> {loan['rate']}%</p>
+        <p><b>Total a pagar:</b> {fmt_money(total_to_pay)}</p>
+        <p><b>Pago por período:</b> {fmt_money(installment)}</p>
+        <p><b>Cuotas pagadas:</b> {cuotas_pagadas}/{term_count}</p>
+        <p><b>Restante total:</b> {fmt_money(restante_total)}</p>
+        <p><b>Fecha final estimada:</b> {end_date_str}</p>
 
-        <p><strong>Semana / cuota actual:</strong> {cuotas_resumen}</p>
-        <p><strong>Total restante estimado:</strong> {fmt_money(restante_total)}</p>
+        <hr>
 
-        <p><strong>Interés pagado (solo pagos marcados como interés):</strong> {fmt_money(loan['total_interest_paid'])}</p>
-        <p><strong>Estado:</strong> {loan['status']}</p>
-        <p><strong>Fecha inicio:</strong> {loan['start_date']}</p>
-        {overdue_html}
-        <a class="btn btn-primary" href="/loan/{loan_id}/payment/new">➕ Registrar pago</a>
-        {receipt_btn}
-        {invoice_buttons}
-    </div>
+        <h3>Enviar factura al cliente</h3>
+        {"<a class='btn btn-primary' target='_blank' href='" + wa_url + "'>📲 Enviar por WhatsApp</a>" if wa_url else "<p>El cliente no tiene número registrado.</p>"}
 
-    <div class="card">
-        <h3>Pagos realizados</h3>
-        <div class="table-wrapper">
-          <table>
-              <thead>
-                  <tr>
-                      <th>ID</th>
-                      <th>Fecha</th>
-                      <th>Monto</th>
-                      <th>Tipo</th>
-                      <th>Nota</th>
-                  </tr>
-              </thead>
-              <tbody>
-                  {payments_html}
-              </tbody>
-          </table>
-        </div>
+        <hr>
+
+        <h3>Pagos recibidos</h3>
+        <table class="table">
+            <tr>
+                <th>ID</th>
+                <th>Fecha</th>
+                <th>Monto</th>
+            </tr>
+            {"".join([
+                f"<tr><td>{p['id']}</td><td>{p['created_at']}</td><td>{fmt_money(p['amount'])}</td></tr>"
+            for p in payments])}
+        </table>
+
+        <a class="btn btn-secondary" href="/loans">Volver</a>
     </div>
     """
 
-    return render_template_string(
-        TPL_LAYOUT,
-        body=body,
-        user=user,
-        flashes=get_flashed_messages(with_categories=True),
-        admin_whatsapp=ADMIN_WHATSAPP,
-        app_brand=APP_BRAND,
-        theme=get_theme()
-    )
+    cur.close()
+    conn.close()
+    return render_template_string(body)
 
 
 @app.route("/loan/<int:loan_id>/payment/new", methods=["GET", "POST"])
@@ -2423,10 +2202,10 @@ def forgot_password():
 
 
 # ============================================================
-#  FINAL – EJECUCIÓN
+# FINAL – EJECUCIÓN
 # ============================================================
 
-# Inicializar BD al importar (sirve para Flask 3 + Render, sin before_first_request)
+# Inicializar BD al arrancar
 init_db()
 
 if __name__ == "__main__":
